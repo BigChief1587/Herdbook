@@ -11,7 +11,7 @@
    Merge:    per record, newest change wins. Deletes are kept as markers so they spread too. */
 
 const HB = window.HB_CONFIG || {};
-const APP_VERSION = '2.0.0-test';
+const APP_VERSION = '2.0.1-test';
 const CHANNEL = /\/test\//.test(location.pathname) || HB.channel === 'test' ? 'test' : 'live';
 const DRIVE = HB.driveBase || 'https://www.googleapis.com';
 const PFX = CHANNEL === 'test' ? 'test-' : '';
