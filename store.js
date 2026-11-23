@@ -11,7 +11,7 @@
    Merge:    per record, newest change wins. Deletes are kept as markers so they spread too. */
 
 const HB = window.HB_CONFIG || {};
-const APP_VERSION = '2.0.1';
+const APP_VERSION = '2.1.0';
 const CHANNEL = /\/test\//.test(location.pathname) || HB.channel === 'test' ? 'test' : 'live';
 const DRIVE = HB.driveBase || 'https://www.googleapis.com';
 const PFX = CHANNEL === 'test' ? 'test-' : '';
@@ -51,10 +51,16 @@ const Store = (() => {
   const nextU = k => Math.max(Date.now(), (U[k] || 0) + 1);
   const getMeta = k => tx('meta', 'readonly', s => rq(s.get(k)));
   const setMeta = (k, v) => tx('meta', 'readwrite', s => { s.put(v, k); });
-  const getPhoto = pid => tx('photos', 'readonly', s => rq(s.get(pid)));
-  const putPhoto = p => tx('photos', 'readwrite', s => { s.put(p); });
+  // pictures are kept as plain bytes: some iPhone versions can't keep a Blob in IndexedDB
+  const unpack = p => { if (p && !p.blob && p.buf) { p = Object.assign({}, p, { blob: new Blob([p.buf], { type: p.type || 'image/jpeg' }) }); delete p.buf; } return p; };
+  const getPhoto = async pid => unpack(await tx('photos', 'readonly', s => rq(s.get(pid))));
+  const putPhoto = async p => {
+    let r = p;
+    if (p.blob) { r = Object.assign({}, p, { buf: await new Response(p.blob).arrayBuffer(), type: p.blob.type || 'image/jpeg' }); delete r.blob; }
+    return tx('photos', 'readwrite', s => { s.put(r); });
+  };
   const delPhoto = pid => tx('photos', 'readwrite', s => { s.delete(pid); });
-  const allPhotos = () => tx('photos', 'readonly', s => rq(s.getAll()));
+  const allPhotos = async () => (await tx('photos', 'readonly', s => rq(s.getAll()))).map(unpack);
   async function clearAll() { await tx(['docs', 'photos', 'meta'], 'readwrite', (a, b, c) => { a.clear(); b.clear(); c.clear(); }); for (const k in U) delete U[k]; }
   return { open, allDocs, putDocs, markSynced, nextU, getMeta, setMeta, getPhoto, putPhoto, delPhoto, allPhotos, clearAll, U };
 })();

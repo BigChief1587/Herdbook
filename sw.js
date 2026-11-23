@@ -3,8 +3,8 @@
    The live copy (/herdbook/) and the test copy (/herdbook/test/) each have their own worker and cache. */
 const SCOPE = self.registration.scope;
 const CH = /\/test\/$/.test(SCOPE) ? 'test' : 'live';
-const CACHE = 'herdbook-' + CH + '-2.0.1';
-const FILES = ['./', 'index.html', 'app.css', 'app.js', 'store.js', 'config.js', 'manifest.webmanifest', 'icon.svg', 'icon-192.png', 'icon-512.png', 'icon-maskable-512.png', 'apple-touch-icon.png'];
+const CACHE = 'herdbook-' + CH + '-2.1.0';
+const FILES = ['./', 'index.html', 'app.css', 'app.js', 'work.js', 'store.js', 'config.js', 'manifest.webmanifest', 'icon.svg', 'icon-192.png', 'icon-512.png', 'icon-maskable-512.png', 'apple-touch-icon.png'];
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES.map(f => new Request(f, { cache: 'reload' })))));
 });

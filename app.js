@@ -2,9 +2,9 @@
 /* HerdBook - cattle records. Records are kept on this device and synced through the
    farm's own Google Drive (see store.js). Works with no signal. */
 
-const COLLS = ['animals','weights','treatments','breedings','pregchecks','moves','pastures','products','money','tasks','settings'];
+const COLLS = ['animals','weights','treatments','breedings','pregchecks','moves','pastures','products','money','tasks','settings','obs','sessions','protocols'];
 const DB = {}; COLLS.forEach(c => DB[c] = []);
-let IX = {}, CHILD = {}, PROG = {}, WT = {}, TR = {}, KEY2A = {}, A2KEY = {};
+let IX = {}, CHILD = {}, PROG = {}, WT = {}, TR = {}, OBS = {}, KEY2A = {}, A2KEY = {};
 const SEL = new Set();
 const UI = { af: { q: '', status: 'Active', type: '', pasture: '', year: '', breed: '' }, tab: {} };
 
@@ -97,12 +97,13 @@ const S = () => Object.assign({}, DEF_SET, DB.settings.find(s => s.id === 'main'
 // ---------------------------------------------------------------- indexes
 function reindex() {
   IX = {}; for (const c of COLLS) { IX[c] = {}; for (const d of DB[c]) IX[c][d.id] = d; }
-  CHILD = {}; PROG = {}; WT = {}; TR = {};
+  CHILD = {}; PROG = {}; WT = {}; TR = {}; OBS = {};
   const push = (m, k, v) => { if (k) (m[k] || (m[k] = [])).push(v); };
   for (const a of DB.animals) { push(CHILD, a.damId, a); push(PROG, a.sireId, a); }
   for (const w of DB.weights) push(WT, w.animalId, w);
   for (const t of DB.treatments) push(TR, t.animalId, t);
-  Object.values(WT).forEach(l => l.sort(byDate)); Object.values(TR).forEach(l => l.sort(byDate));
+  for (const o of DB.obs) push(OBS, o.animalId, o);
+  Object.values(WT).forEach(l => l.sort(byDate)); Object.values(TR).forEach(l => l.sort(byDate)); Object.values(OBS).forEach(l => l.sort(byDate));
   Object.values(CHILD).forEach(l => l.sort((a, b) => (a.birthDate || '').localeCompare(b.birthDate || '')));
   // a unique key for every animal: its tag, plus the birth year when a tag is reused
   const base = a => (a.tag || a.name || 'no tag').trim();
@@ -144,16 +145,26 @@ const weanW = a => wOf(a).find(w => w.kind === 'Weaning') || null;
 const yearlingW = a => wOf(a).find(w => w.kind === 'Yearling') || null;
 const isWeaned = a => !!a.weanDate || !!weanW(a);
 const calvesOf = a => CHILD[a.id] || [];
+// The kind you pick on the animal wins. A calf you picked grows up on its own when it is weaned
+// (or reaches 300 days); a heifer becomes a cow when a calf is recorded on her.
 function typeOf(a) {
-  const d = ageDays(a);
-  const calf = d != null && d < 300 && !isWeaned(a);
-  if (a.sex === 'F') { if (calvesOf(a).length || a.calvedBefore) return 'Cow'; return calf ? 'Heifer calf' : 'Heifer'; }
+  const d = ageDays(a), k = a.kind;
+  const calfAge = d != null && d < 300 && !isWeaned(a);
+  const calf = k && /calf/.test(k) ? !isWeaned(a) && (d == null || d < 300) : (k ? false : calfAge);
+  if (a.sex === 'F') { if (calvesOf(a).length || a.calvedBefore || k === 'Cow') return 'Cow'; return calf ? 'Heifer calf' : 'Heifer'; }
   if (a.sex === 'M') return calf ? 'Bull calf' : 'Bull';
   if (a.sex === 'S') return calf ? 'Steer calf' : 'Steer';
   return 'Unknown';
 }
 const TYPES = ['Cow', 'Heifer', 'Bull', 'Steer', 'Heifer calf', 'Bull calf', 'Steer calf'];
-const SEXES = [['F', 'Female (heifer / cow)'], ['M', 'Bull'], ['S', 'Steer']];
+const KIND_SEX = { 'Cow': 'F', 'Heifer': 'F', 'Heifer calf': 'F', 'Bull': 'M', 'Bull calf': 'M', 'Steer': 'S', 'Steer calf': 'S' };
+// write a picked kind onto an animal record (sex + kind + the old "has calved" flag)
+function setKind(rec, kind) {
+  if (!KIND_SEX[kind]) return rec;
+  rec.sex = KIND_SEX[kind]; rec.kind = kind;
+  if (kind === 'Cow') rec.calvedBefore = true; else if (rec.sex === 'F') rec.calvedBefore = false;
+  return rec;
+}
 const isFemale = a => a.sex === 'F';
 const isMale = a => a.sex === 'M';
 const breedable = a => isActive(a) && a.sex === 'F' && (typeOf(a) === 'Cow' || (typeOf(a) === 'Heifer' && (ageDays(a) == null || ageDays(a) >= 300)));
@@ -238,11 +249,16 @@ function adgBetween(w1, w2) { const d = daysBetween(w1.date, w2.date); return d 
 
 // ---------------------------------------------------------------- router
 const ROUTES = {};
-const NAV = [['dashboard', 'Home'], ['animals', 'Animals'], ['calving', 'Calving'], ['breeding', 'Breeding'], ['health', 'Health'], ['weights', 'Weights'], ['pastures', 'Pastures'], ['money', 'Money'], ['tasks', 'Tasks'], ['reports', 'Reports'], ['settings', 'Settings']];
+const NAV = [['dashboard', 'Home'], ['animals', 'Animals'], ['work', 'Work cattle'], ['calving', 'Calving'], ['breeding', 'Breeding'], ['health', 'Health'], ['weights', 'Weights'], ['pastures', 'Pastures'], ['money', 'Money'], ['tasks', 'Tasks'], ['reports', 'Reports'], ['settings', 'Settings']];
 function route() { const [r, ...rest] = location.hash.replace(/^#\/?/, '').split('/'); return { r: ROUTES[r] ? r : 'dashboard', args: rest.map(decodeURIComponent) }; }
 function renderNav(cur) {
   $('#nav').innerHTML = `${CHANNEL === 'test' ? '<div class="testbar">TEST COPY — not your real herd</div>' : ''}<div class="brand"><img src="icon.svg" alt=""><div><b>${esc(S().farmName)}</b><button id="sync" class="sync" onclick="tapSync()"></button></div><button class="menu" onclick="document.body.classList.toggle('navopen')" aria-label="Menu">&#9776;</button></div>
   <nav>${NAV.map(([k, l]) => `<a href="#/${k}" class="${cur === k || (cur === 'animal' && k === 'animals') ? 'on' : ''}" onclick="document.body.classList.remove('navopen')">${l}</a>`).join('')}</nav>`;
+  // phone: tabs along the bottom, in thumb reach
+  let bn = $('#bnav'); if (!bn) { bn = document.createElement('div'); bn.id = 'bnav'; document.body.appendChild(bn); }
+  const tabs = [['dashboard', 'Home', '<path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/>'], ['animals', 'Animals', '<path d="M4 8c2-3 5-3 8-3s6 0 8 3l-2 3v6a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2v-6z"/><path d="M4 8L2 6M20 8l2-2"/>'], ['work', 'Work', '<path d="M9 11l3 3 8-8"/><path d="M20 12v7a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h9"/>'], ['money', 'Money', '<path d="M12 2v20M17 6H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>'], ['more', 'More', '<path d="M4 6h16M4 12h16M4 18h16"/>']];
+  const inMain = ['dashboard', 'animals', 'animal', 'work', 'money'].includes(cur);
+  bn.innerHTML = tabs.map(([k, l, p]) => `<a ${k === 'more' ? `href="javascript:void 0" onclick="document.body.classList.toggle('navopen');window.scrollTo(0,0)"` : `href="#/${k}"`} class="${(k === cur || (k === 'animals' && cur === 'animal') || (k === 'more' && !inMain)) ? 'on' : ''}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${p}</svg>${l}</a>`).join('');
   renderSync();
 }
 // the little sync line under the farm name
@@ -298,26 +314,98 @@ function modal(html, opt = {}) {
   return $('#modal-root .modal');
 }
 function closeModal() { $('#modal-root').innerHTML = ''; document.body.classList.remove('noscroll'); if (UI.stale) { UI.stale = false; refresh(); } }
-document.addEventListener('keydown', e => { if (e.key === 'Escape' && $('#modal-root').innerHTML) closeModal(); });
+// Escape closes a form only when you aren't typing in it (so a half-typed receipt isn't lost)
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && $('#modal-root').innerHTML && !/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) closeModal(); });
 
 function opts(list, val, blank = true) {
   return (blank ? '<option value=""></option>' : '') + list.map(o => { const [v, l] = Array.isArray(o) ? o : [o, o]; return `<option value="${esc(v)}"${String(v) === String(val ?? '') ? ' selected' : ''}>${esc(l)}</option>`; }).join('');
 }
-function animalOptions(filter) {
+// every animal as a pick-list item: value = its tag key, with kind / name / status underneath
+function animalItems(filter) {
   return DB.animals.filter(a => !filter || filter(a)).sort((a, b) => (isActive(a) ? 0 : 1) - (isActive(b) ? 0 : 1) || natCmp(keyOf(a), keyOf(b)))
-    .map(a => `<option value="${esc(keyOf(a))}">${esc(typeOf(a))}${a.name && a.name !== a.tag ? ' · ' + esc(a.name) : ''}${isActive(a) ? '' : ' · ' + esc(a.status)}</option>`).join('');
+    .map(a => ({ v: keyOf(a), s: [typeOf(a), a.name && a.name !== a.tag ? a.name : '', a.breed, pastureName(a.pastureId), isActive(a) ? '' : a.status].filter(Boolean).join(' · ') }));
 }
+
+// ---------------- pick box: type to narrow it down, or tap ▾ to scroll the WHOLE list (phones cut datalists short)
+const COMBO = {};
+let CB = null;
+function comboHtml(id, name, val, ph, items, cls = '') {
+  COMBO[id] = typeof items === 'function' ? items : () => items;
+  return `<div class="combo"><input id="${id}" name="${name}" class="${cls}" value="${esc(val)}" autocomplete="off" autocapitalize="words" placeholder="${esc(ph || '')}" data-combo="1"><button type="button" class="cbtn" tabindex="-1" aria-label="Show the whole list" data-for="${id}">▾</button></div>`;
+}
+const comboItem = o => typeof o === 'string' ? { v: o } : Array.isArray(o) ? { v: o[0], l: o[1] } : o;
+function comboOpen(inp, all) {
+  if (CB && CB.inp === inp) { CB.all = all; return comboDraw(); }
+  comboClose(); if (!COMBO[inp.id]) return;
+  const panel = document.createElement('div'); panel.className = 'cpanel';
+  panel.addEventListener('mousedown', e => e.preventDefault());
+  inp.parentNode.appendChild(panel); CB = { inp, panel, all, hi: -1, items: [] }; comboDraw();
+}
+function comboClose() { if (CB) { CB.panel.remove(); CB = null; } }
+function comboDraw() {
+  const { inp, panel } = CB, q = CB.all ? '' : inp.value.trim().toLowerCase();
+  let items = COMBO[inp.id]().map(comboItem);
+  if (q) {
+    items = items.filter(o => !o.g && (o.v + ' ' + (o.l || '') + ' ' + (o.s || '')).toLowerCase().includes(q));
+    items.sort((a, b) => (String(a.v).toLowerCase().startsWith(q) ? 0 : 1) - (String(b.v).toLowerCase().startsWith(q) ? 0 : 1));
+  }
+  CB.items = items;
+  const cur = inp.value.trim().toLowerCase();
+  panel.innerHTML = (items.length ? items.map((o, i) => o.g ? `<div class="cgrp">${esc(o.g)}</div>` : `<div class="copt${i === CB.hi ? ' hi' : ''}${String(o.v).toLowerCase() === cur ? ' cur' : ''}" data-i="${i}"><b>${esc(o.l || o.v)}</b>${o.s ? `<small>${esc(o.s)}</small>` : ''}</div>`).join('')
+    : `<div class="cnone">Nothing in the list matches — what you typed will be used.</div>`) + `<div class="cclose" data-close="1">Close list</div>`;
+  if (CB.all) { const c = panel.querySelector('.cur'); if (c) c.scrollIntoView({ block: 'nearest' }); }
+}
+function comboPick(i) {
+  const o = CB && CB.items[i]; if (!o || o.g) return;
+  const inp = CB.inp; inp.value = o.v; comboClose();
+  inp.dispatchEvent(new Event('input', { bubbles: true })); inp.dispatchEvent(new Event('change', { bubbles: true }));
+}
+document.addEventListener('focusin', e => { const t = e.target; if (t.dataset && t.dataset.combo) comboOpen(t, true); else if (CB && !t.closest('.combo')) comboClose(); });
+document.addEventListener('input', e => { if (CB && e.target === CB.inp && e.isTrusted) { CB.all = false; CB.hi = -1; comboDraw(); } });
+document.addEventListener('click', e => {
+  const b = e.target.closest('.cbtn');
+  if (b) { const inp = document.getElementById(b.dataset.for); if (CB && CB.inp === inp && CB.all) comboClose(); else comboOpen(inp, true); return; }
+  const o = e.target.closest('.copt'); if (o && CB) return comboPick(+o.dataset.i);
+  if (e.target.closest('[data-close]')) return comboClose();
+  if (CB && !e.target.closest('.combo')) comboClose();
+});
+document.addEventListener('keydown', e => {
+  if (!CB || e.target !== CB.inp) return;
+  const sel = () => CB.items.map((o, i) => o.g ? -1 : i).filter(i => i >= 0);
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault(); const l = sel(); if (!l.length) return;
+    let p = l.indexOf(CB.hi); p = e.key === 'ArrowDown' ? Math.min(l.length - 1, p + 1) : Math.max(0, p - 1); CB.hi = l[p]; comboDraw();
+    const h = CB.panel.querySelector('.hi'); if (h) h.scrollIntoView({ block: 'nearest' });
+  } else if (e.key === 'Enter' && CB.hi >= 0) { e.preventDefault(); comboPick(CB.hi); }
+  else if (e.key === 'Escape') { e.stopPropagation(); comboClose(); }
+  else if (e.key === 'Tab') comboClose();
+}, true);
+
+// big tap buttons for short choices (kind, yes/no, scores)
+function segHtml(id, name, list, val, cls = '') {
+  return `<input type="hidden" id="${id}" name="${name}" value="${esc(val ?? '')}"><div class="seg ${cls}" data-for="${id}">${list.map(o => { const [v, l] = Array.isArray(o) ? o : [o, o]; return `<button type="button" data-v="${esc(v)}" class="${String(v) === String(val ?? '') ? 'on' : ''}">${esc(l)}</button>`; }).join('')}</div>`;
+}
+document.addEventListener('click', e => {
+  const b = e.target.closest('.seg button'); if (!b) return;
+  const seg = b.parentNode, inp = seg.dataset.for && document.getElementById(seg.dataset.for);
+  if (!inp) return;
+  const v = seg.classList.contains('toggle') && b.classList.contains('on') ? '' : b.dataset.v;
+  seg.querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b && v !== ''));
+  inp.value = v; inp.dispatchEvent(new Event('change', { bubbles: true }));
+});
 function fieldHtml(f, v) {
-  const id = 'f_' + f.k, req = f.req ? ' required' : '', val = v == null ? '' : v;
+  const id = 'f_' + f.k, val = v == null ? '' : v, big = f.big ? ' big' : '';
   let inp;
   switch (f.type) {
     case 'select': inp = `<select id="${id}" name="${f.k}">${opts(f.options, val, f.blank !== false)}</select>`; break;
+    case 'buttons': inp = segHtml(id, f.k, f.options, val); break;
     case 'textarea': inp = `<textarea id="${id}" name="${f.k}" rows="${f.rows || 3}">${esc(val)}</textarea>`; break;
     case 'check': inp = `<label class="chk"><input type="checkbox" id="${id}" name="${f.k}"${val ? ' checked' : ''}> ${esc(f.text || '')}</label>`; break;
-    case 'animal': inp = `<input id="${id}" name="${f.k}" list="dl_${f.k}" value="${esc(val)}" autocomplete="off" placeholder="${esc(f.ph || 'Type a tag')}"><datalist id="dl_${f.k}">${animalOptions(f.filter)}</datalist>`; break;
-    case 'list': inp = `<input id="${id}" name="${f.k}" list="dl_${f.k}" value="${esc(val)}" autocomplete="off" placeholder="${esc(f.ph || '')}"><datalist id="dl_${f.k}">${f.options.map(o => `<option value="${esc(o)}">`).join('')}</datalist>`; break;
-    case 'number': inp = `<input id="${id}" name="${f.k}" type="number" step="any" inputmode="decimal" value="${esc(val)}" placeholder="${esc(f.ph || '')}">`; break;
-    default: inp = `<input id="${id}" name="${f.k}" type="${f.type || 'text'}" value="${esc(val)}" placeholder="${esc(f.ph || '')}"${f.type === 'date' ? '' : ' autocomplete="off"'}>`;
+    case 'photo': inp = `<label class="btn photobtn">📷 Take or pick a photo<input type="file" accept="image/*" multiple id="${id}" name="${f.k}" style="display:none" onchange="this.closest('.fld').querySelector('.hint').textContent=this.files.length?plural(this.files.length,'photo')+' ready — saved with the animal':''"></label>`; f.hint = f.hint || ' '; break;
+    case 'animal': inp = comboHtml(id, f.k, val, f.ph || 'Type a tag, or tap ▾', () => animalItems(f.filter), big); break;
+    case 'list': inp = comboHtml(id, f.k, val, f.ph || 'Type, or tap ▾ for the list', f.options, big); break;
+    case 'number': inp = `<input id="${id}" name="${f.k}" class="${big}" type="number" step="any" inputmode="decimal" value="${esc(val)}" placeholder="${esc(f.ph || '')}">`; break;
+    default: inp = `<input id="${id}" name="${f.k}" class="${big}" type="${f.type || 'text'}" value="${esc(val)}" placeholder="${esc(f.ph || '')}"${f.type === 'date' ? '' : ' autocomplete="off"'}>`;
   }
   return `<div class="fld${f.full ? ' full' : ''}"><label for="${id}">${esc(f.label)}${f.req ? ' <span class="req">*</span>' : ''}</label>${inp}${f.hint ? `<div class="hint">${f.hint}</div>` : ''}</div>`;
 }
@@ -326,17 +414,21 @@ function openForm(o) {
   <form id="mf" novalidate><div class="grid2">${o.fields.map(f => f.type === 'section' ? `<h3>${esc(f.label)}</h3>` : fieldHtml(f, o.values ? o.values[f.k] : null)).join('')}</div>
   ${o.extra || ''}<div class="err" id="mferr"></div>
   <div class="mfoot">${o.del ? '<button type="button" class="btn danger" id="mfdel">Delete</button>' : ''}<span class="sp"></span>
-  <button type="button" class="btn" onclick="closeModal()">Cancel</button><button class="btn primary" type="submit">${esc(o.saveText || 'Save')}</button></div></form>`, { wide: o.wide });
+  <button type="button" class="btn" onclick="closeModal()">Cancel</button>${o.saveAnother ? '<button type="button" class="btn" id="mfagain">Save &amp; add another</button>' : ''}<button class="btn primary" type="submit">${esc(o.saveText || 'Save')}</button></div></form>`, { wide: o.wide });
   const form = m.querySelector('#mf');
   if (o.onChange) { form.addEventListener('change', e => o.onChange(form, e)); form.addEventListener('input', e => o.onChange(form, e)); o.onChange(form, null); }
+  let again = false;
+  if (o.saveAnother) m.querySelector('#mfagain').onclick = () => { again = true; form.requestSubmit ? form.requestSubmit() : form.onsubmit(new Event('submit')); };
   form.onsubmit = async e => {
     e.preventDefault();
+    const ctx = { again }; again = false;
     const v = {}, errs = [];
     for (const f of o.fields) {
       if (f.type === 'section') continue;
       const el = form.elements[f.k]; if (!el) continue;
       let x;
       if (f.type === 'check') x = el.checked;
+      else if (f.type === 'photo') x = [...el.files];
       else {
         x = el.value.trim();
         if (f.type === 'number') { if (x === '') x = null; else { x = parseFloat(x); if (isNaN(x)) errs.push(f.label + ' must be a number'); } }
@@ -354,7 +446,7 @@ function openForm(o) {
     if (o.validate) { const e2 = o.validate(v); if (e2) errs.push(e2); }
     if (errs.length) { form.querySelector('#mferr').textContent = errs.join(' · '); return; }
     const btn = form.querySelector('button[type=submit]'); btn.disabled = true;
-    try { await o.save(v); closeModal(); refresh(); toast(o.toastText || 'Saved'); }
+    try { await o.save(v, ctx); closeModal(); refresh(); toast(o.toastText || 'Saved'); if (ctx.again && o.again) o.again(); }
     catch (err) { form.querySelector('#mferr').textContent = 'Could not save: ' + err.message; btn.disabled = false; }
   };
   if (o.del) m.querySelector('#mfdel').onclick = async () => {
@@ -391,14 +483,16 @@ function pickThen(title, filter, next, hint) {
 
 // ---------------------------------------------------------------- actions: animals
 function actEditAnimal(id, preset) {
-  const a = id ? AN(id) : Object.assign({ status: 'Active', sex: 'F' }, preset || {});
+  const a = id ? AN(id) : Object.assign({ status: 'Active', sex: 'F', kind: 'Cow' }, preset || {});
   const set = S();
   openForm({
     title: id ? 'Edit ' + keyOf(a) : 'Add an animal', wide: true,
-    values: Object.assign({}, a, { dam: damText(a), sire: sireText(a) }),
+    values: Object.assign({}, a, { dam: damText(a), sire: sireText(a), kindPick: id ? typeOf(a) : (a.kind || 'Cow') }),
+    saveAnother: !id,
     fields: [
-      { k: 'tag', label: 'Ear tag', ph: 'e.g. 214' }, { k: 'name', label: 'Name' },
-      { k: 'sex', label: 'Sex', type: 'select', options: SEXES, blank: false }, { k: 'birthDate', label: 'Birth date', type: 'date' },
+      { k: 'tag', label: 'Ear tag', ph: 'e.g. 214', big: true }, { k: 'name', label: 'Name' },
+      { k: 'kindPick', label: 'Kind', type: 'buttons', options: TYPES, req: true, full: true, hint: 'Pick what it is now. Calves grow up on their own when weaned; a heifer becomes a cow when you record her calf.' },
+      { k: 'birthDate', label: 'Birth date', type: 'date' }, { k: 'photo', label: 'Photo', type: 'photo' },
       { k: 'breed', label: 'Breed', type: 'list', options: set.breeds }, { k: 'color', label: 'Color / markings', type: 'list', options: set.colors },
       { k: 'pastureId', label: 'Pasture', type: 'select', options: pastureOpts() }, { k: 'status', label: 'Status', type: 'select', options: ['Active', 'Sold', 'Dead', 'Reference'], blank: false, hint: 'Reference = a sire or dam you keep only for pedigree (an AI bull, a cow you never owned).' },
       { type: 'section', label: 'Parents' },
@@ -408,18 +502,26 @@ function actEditAnimal(id, preset) {
       { k: 'eid', label: 'EID / RFID tag' }, { k: 'regNo', label: 'Registration #' },
       { k: 'brand', label: 'Brand / tattoo' }, { k: 'horn', label: 'Horns', type: 'select', options: ['Polled', 'Horned', 'Scurred', 'Dehorned'] },
       { k: 'birthWeight', label: 'Birth weight (lb)', type: 'number' }, { k: 'calvingEase', label: 'Calving ease', type: 'select', options: EASE },
-      { k: 'calvedBefore', label: 'Has calved', type: 'check', text: 'Bought or raised as a cow (counts as a cow with no calf records)' },
+      { k: 'cull', label: 'Cull', type: 'check', text: 'Marked to cull' },
       { type: 'section', label: 'Purchase' },
       { k: 'purchaseDate', label: 'Bought on', type: 'date' }, { k: 'purchasePrice', label: 'Price paid ($)', type: 'number' },
       { k: 'purchasedFrom', label: 'Bought from', full: true },
       { k: 'notes', label: 'Notes', type: 'textarea', full: true }
     ],
-    validate: v => (!v.tag && !v.name) ? 'Give it an ear tag or a name' : null,
-    save: async v => {
+    validate: v => {
+      if (!v.tag && !v.name) return 'Give it an ear tag or a name';
+      if (v.tag && !v._dupOk) { const d = DB.animals.find(x => x.id !== id && isActive(x) && (x.tag || '').toLowerCase() === v.tag.toLowerCase()); if (d && !confirm(`Tag ${v.tag} is already on an active ${typeOf(d).toLowerCase()}. Save another animal with the same tag?`)) return 'Change the tag, or save again'; }
+      return null;
+    },
+    save: async (v, ctx) => {
+      const photos = v.photo || []; delete v.photo;
+      Object.assign(UI, { lastKind: v.kindPick, lastBreed: v.breed, lastPasture: v.pastureId, lastBought: v.purchaseDate, lastFrom: v.purchasedFrom });
       const rec = Object.assign({}, a, v);
+      setKind(rec, v.kindPick); delete rec.kindPick;
       rec.damId = v.dam; rec.damName = v.dam ? null : v.damText || null;
       rec.sireId = v.sire; rec.sireName = v.sire ? null : v.sireText || null;
       delete rec.dam; delete rec.sire; delete rec.damText; delete rec.sireText;
+      if (photos.length) { rec.photos = rec.photos ? rec.photos.slice() : []; for (const f of photos) rec.photos.push(await photoFromFile(f)); }
       if (rec.damId && rec.damId === rec.id) throw new Error('An animal can’t be its own dam');
       const ops = [{ coll: 'animals', data: rec }];
       if (!id && rec.purchaseDate && rec.purchasePrice) ops.push({ coll: 'money', data: { date: rec.purchaseDate, kind: 'Expense', category: 'Cattle purchases', amount: rec.purchasePrice, animalId: null, note: 'Bought ' + (rec.tag || rec.name) + (rec.purchasedFrom ? ' from ' + rec.purchasedFrom : '') } });
@@ -427,11 +529,12 @@ function actEditAnimal(id, preset) {
       if (!rec.id) rec.id = uid();
       ops.forEach(o => { if (o.coll !== 'animals' && 'animalId' in o.data) o.data.animalId = rec.id; });
       await saveMany(ops);
-      if (!id) location.hash = '#/animal/' + rec.id;
+      if (!id && !(ctx && ctx.again)) location.hash = '#/animal/' + rec.id;
     },
+    again: () => actEditAnimal(null, { kind: (UI.lastKind || 'Cow'), breed: UI.lastBreed, pastureId: UI.lastPasture, purchaseDate: UI.lastBought, purchasedFrom: UI.lastFrom }),
     del: id ? async () => {
       const ops = [{ coll: 'animals', del: id }];
-      for (const c of ['weights', 'treatments', 'moves']) DB[c].filter(x => x.animalId === id).forEach(x => ops.push({ coll: c, del: x.id }));
+      for (const c of ['weights', 'treatments', 'moves', 'obs']) DB[c].filter(x => x.animalId === id).forEach(x => ops.push({ coll: c, del: x.id }));
       for (const c of ['breedings', 'pregchecks']) DB[c].filter(x => x.femaleId === id).forEach(x => ops.push({ coll: c, del: x.id }));
       for (const k of calvesOf(a)) ops.push({ coll: 'animals', data: Object.assign({}, k, { damId: null, damName: keyOf(a) }) });
       for (const k of PROG[id] || []) ops.push({ coll: 'animals', data: Object.assign({}, k, { sireId: null, sireName: keyOf(a) }) });
@@ -500,7 +603,7 @@ function actTreat(ids) {
     title: `Treatment — ${plural(ids.length, 'animal')}`, wide: ids.length > 1,
     intro: ids.length > 1 ? 'One record goes on each animal: ' + esc(ids.slice(0, 30).map(i => keyOf(AN(i))).join(', ')) + (ids.length > 30 ? ' …' : '') : esc(keyOf(AN(ids[0]))),
     fields: [
-      { k: 'date', label: 'Date', type: 'date', req: true }, { k: 'product', label: 'Product', type: 'list', options: prods.map(p => p.name), req: true, ph: 'Vaccine, wormer, antibiotic…' },
+      { k: 'date', label: 'Date', type: 'date', req: true }, { k: 'product', label: 'Product', type: 'list', options: productItems, req: true, ph: 'Vaccine, wormer, antibiotic… or tap ▾' },
       { k: 'dose', label: 'Dose', ph: 'e.g. 2 cc' }, { k: 'route', label: 'Route', type: 'list', options: set.routes },
       { k: 'site', label: 'Injection site', type: 'list', options: set.sites }, { k: 'lot', label: 'Lot / serial #' },
       { k: 'withdrawalDays', label: 'Slaughter withdrawal (days)', type: 'number', hint: 'From the label. 0 = none.' }, { k: 'boosterDays', label: 'Booster in (days)', type: 'number', hint: 'Leave blank if no booster.' },
@@ -511,8 +614,10 @@ function actTreat(ids) {
     values: { date: today(), remember: true },
     onChange: (f, e) => {
       if (!e || e.target.name !== 'product') return;
-      const p = DB.products.find(p => p.name.toLowerCase() === f.elements.product.value.trim().toLowerCase()); if (!p) return;
-      for (const k of ['dose', 'route', 'site', 'withdrawalDays', 'boosterDays']) if (p[k] != null && p[k] !== '') f.elements[k].value = p[k];
+      const p = productByName(f.elements.product.value); if (!p) return;
+      const w = ids.length === 1 ? lwOf(AN(ids[0])) : null;
+      f.elements.dose.value = doseText(p, w) || '';
+      for (const k of ['route', 'site', 'withdrawalDays', 'boosterDays']) if (p[k] != null && p[k] !== '') f.elements[k].value = p[k];
     },
     save: async v => {
       const batch = uid(), ops = [];
@@ -521,8 +626,8 @@ function actTreat(ids) {
         withdrawalDays: v.withdrawalDays, withdrawalDate: v.withdrawalDays ? addDays(v.date, v.withdrawalDays) : null,
         boosterDate: v.boosterDays ? addDays(v.date, v.boosterDays) : null, batch } });
       if (v.remember) {
-        const p = DB.products.find(p => p.name.toLowerCase() === v.product.toLowerCase());
-        ops.push({ coll: 'products', data: Object.assign({}, p || {}, { name: p ? p.name : v.product, dose: v.dose, route: v.route, site: v.site, withdrawalDays: v.withdrawalDays, boosterDays: v.boosterDays }) });
+        const p = DB.products.find(p => p.name.toLowerCase() === v.product.toLowerCase()), base = p || catalogProduct(v.product) || {};
+        ops.push({ coll: 'products', data: Object.assign({}, base, { name: base.name || v.product, route: v.route, site: v.site, withdrawalDays: v.withdrawalDays, boosterDays: v.boosterDays }, base.mlPer ? {} : { dose: v.dose }) });
       }
       await saveMany(ops);
     }, toastText: `Treatment saved on ${plural(ids.length, 'animal')}`
@@ -541,20 +646,6 @@ function actEditTreatment(id) {
     ],
     save: v => put1('treatments', Object.assign({}, t, v, { withdrawalDate: v.withdrawalDays ? addDays(v.date, v.withdrawalDays) : null })),
     del: () => del1('treatments', id)
-  });
-}
-function actProduct(id) {
-  const p = id ? IX.products[id] : {}, set = S();
-  openForm({
-    title: id ? p.name : 'Add a product', values: p,
-    fields: [
-      { k: 'name', label: 'Product name', req: true, full: true }, { k: 'dose', label: 'Usual dose' }, { k: 'route', label: 'Route', type: 'list', options: set.routes },
-      { k: 'site', label: 'Injection site', type: 'list', options: set.sites }, { k: 'withdrawalDays', label: 'Slaughter withdrawal (days)', type: 'number' },
-      { k: 'boosterDays', label: 'Booster in (days)', type: 'number' }, { k: 'kind', label: 'Kind', type: 'list', options: ['Vaccine', 'Antibiotic', 'Wormer / dewormer', 'Pour-on', 'Implant', 'Vitamin / mineral', 'Other'] },
-      { k: 'notes', label: 'Notes', type: 'textarea', full: true, rows: 2 }
-    ],
-    save: v => put1('products', Object.assign({}, p, v)),
-    del: id ? () => del1('products', id) : null, delConfirm: 'Remove this product from the list? Old treatment records keep its name.'
   });
 }
 
@@ -741,19 +832,6 @@ function actPasture(id) {
     del: id ? async () => { if (DB.animals.some(a => a.pastureId === id && isActive(a))) throw new Error('Move the cattle out first'); await del1('pastures', id); } : null
   });
 }
-function actMoney(id, preset) {
-  const t = id ? IX.money[id] : Object.assign({ date: today(), kind: 'Expense' }, preset || {}), set = S();
-  openForm({
-    title: id ? 'Edit entry' : 'Add income or expense', values: Object.assign({}, t, { animal: t.animalId ? keyOf(AN(t.animalId)) : '' }),
-    fields: [{ k: 'kind', label: 'Kind', type: 'select', options: ['Expense', 'Income'], blank: false }, { k: 'date', label: 'Date', type: 'date', req: true },
-      { k: 'category', label: 'Category', type: 'list', options: [...set.expenseCats, ...set.incomeCats], req: true }, { k: 'amount', label: 'Amount ($)', type: 'number', req: true },
-      { k: 'payee', label: 'Paid to / from' }, { k: 'animal', label: 'Animal (optional)', type: 'animal', strict: true },
-      { k: 'note', label: 'Note', full: true }],
-    onChange: (f, e) => { if (e && e.target.name !== 'kind') return; const l = f.elements.kind.value === 'Income' ? set.incomeCats : set.expenseCats; $('#dl_category').innerHTML = l.map(o => `<option value="${esc(o)}">`).join(''); },
-    save: v => { const r = Object.assign({}, t, v, { animalId: v.animal }); delete r.animal; delete r.animalText; return put1('money', r); },
-    del: id ? () => del1('money', id) : null
-  });
-}
 function actTask(id, preset) {
   const t = id ? IX.tasks[id] : Object.assign({ date: today() }, preset || {});
   openForm({
@@ -764,23 +842,52 @@ function actTask(id, preset) {
     del: id ? () => del1('tasks', id) : null
   });
 }
+// notes and scores (docility, scrotal, udder, BSE…) on one animal
+const obsText = o => [o.value != null && o.value !== '' ? o.value + (o.unit ? ' ' + o.unit : '') : '', o.note].filter(Boolean).join(' · ');
+function actNote(id) {
+  openForm({
+    title: 'Note on ' + keyOf(AN(id)), values: { date: today() },
+    fields: [{ k: 'date', label: 'Date', type: 'date', req: true }, { k: 'note', label: 'Note', type: 'textarea', full: true, rows: 4, req: true, ph: 'e.g. limping right hind, bad bag, wild, lost tag…' },
+      { k: 'flag', label: 'Also', type: 'check', text: 'Put it on my task list to check back', full: true }],
+    save: async v => {
+      const ops = [{ coll: 'obs', data: { animalId: id, date: v.date, kind: 'Note', note: v.note } }];
+      if (v.flag) ops.push({ coll: 'tasks', data: { title: 'Check ' + keyOf(AN(id)) + ': ' + v.note.slice(0, 60), date: addDays(v.date, 7), animalId: id } });
+      await saveMany(ops);
+    }, toastText: 'Note saved'
+  });
+}
+function actEditObs(id) {
+  const o = IX.obs[id];
+  openForm({
+    title: o.kind + ' — ' + keyOf(AN(o.animalId)), values: o,
+    fields: [{ k: 'date', label: 'Date', type: 'date', req: true }, { k: 'value', label: 'Value / score' }, { k: 'note', label: 'Note', type: 'textarea', full: true, rows: 3 }],
+    save: v => put1('obs', Object.assign({}, o, v)), del: () => del1('obs', id)
+  });
+}
 async function toggleTask(id) { const t = IX.tasks[id]; await put1('tasks', Object.assign({}, t, { done: !t.done })); refresh(); }
 
 // "show these animals" links: the id list is parked here and the button carries its number
 const LISTS = [];
 const listRef = ids => { LISTS.push(ids); return LISTS.length - 1; };
 function showList(i) { SEL.clear(); (LISTS[i] || []).forEach(id => SEL.add(id)); UI.onlySel = true; location.hash = '#/animals'; refresh(); }
-function exportMoney(y) {
-  download('HerdBook money ' + y + '.csv', toCSV([['Date', 'Kind', 'Category', 'Amount', 'Paid to/from', 'Animal', 'Note'],
-    ...DB.money.filter(m => (m.date || '').startsWith(y)).sort(byDate).map(m => [m.date, m.kind, m.category, m.amount, m.payee, m.animalId && AN(m.animalId) ? keyOf(AN(m.animalId)) : '', m.note])]));
-}
 
+// big "type a tag" box that jumps straight to the animal
+function findAnimalBox() {
+  const m = modal(`<h2>Find an animal</h2><div class="fld">${comboHtml('fa_t', 'fa', '', 'Tag, name or EID', () => animalItems(), 'big')}</div><div class="err" id="fa_e"></div>
+   <div class="mfoot"><span class="sp"></span><button class="btn" onclick="closeModal()">Cancel</button><button class="btn primary" id="fa_go">Open</button></div>`);
+  const go = () => { const a = findAnimal($('#fa_t').value); if (!a) { $('#fa_e').textContent = 'No animal with that tag.'; return; } closeModal(); location.hash = '#/animal/' + a.id; };
+  m.querySelector('#fa_go').onclick = go;
+  $('#fa_t').addEventListener('change', () => { if (findAnimal($('#fa_t').value)) go(); });
+  $('#fa_t').addEventListener('keydown', e => { if (e.key === 'Enter' && !(CB && CB.hi >= 0)) { e.preventDefault(); go(); } });
+  setTimeout(() => $('#fa_t') && $('#fa_t').focus(), 50);
+}
 // group actions on the Animals-page selection
 const selIds = filter => [...SEL].filter(id => AN(id) && (!filter || filter(AN(id))));
 function groupAct(kind) {
   const ids = selIds();
   if (!ids.length) return;
   if (kind === 'move') actMove(ids);
+  if (kind === 'kind') actKind(ids);
   if (kind === 'treat') actTreat(ids);
   if (kind === 'weigh') actWeigh(ids);
   if (kind === 'sell') actSell(ids);
@@ -825,6 +932,7 @@ function eventsFor(a) {
   for (const p of DB.pregchecks.filter(p => p.femaleId === a.id)) E(p.date, 'Preg check', `<b>${esc(p.result)}</b>${p.fetalDays ? ' · ' + p.fetalDays + ' days' : ''}${p.note ? ' · ' + esc(p.note) : ''}`, `actEditPreg('${p.id}')`);
   for (const c of calvesOf(a)) E(c.birthDate, 'Calved', `${aLink(c.id)} · ${typeOf(c).toLowerCase()}${c.birthWeight ? ' · ' + num(c.birthWeight) + ' lb' : ''}${c.status === 'Dead' ? ' · <span class="chip red">dead</span>' : ''}`);
   for (const m of DB.moves.filter(m => m.animalId === a.id)) E(m.date, 'Moved', 'to ' + esc(pastureName(m.pastureId)));
+  for (const o of OBS[a.id] || []) E(o.date, o.kind, esc(obsText(o)), `actEditObs('${o.id}')`);
   if (a.saleDate) E(a.saleDate, 'Sold', [esc(a.buyer), a.salePrice ? usd(a.salePrice) : '', a.saleWeight ? num(a.saleWeight) + ' lb' : ''].filter(Boolean).join(' · '));
   if (a.deathDate) E(a.deathDate, 'Died', esc(a.deathCause));
   if (a.weanDate && !weanW(a)) E(a.weanDate, 'Weaned', '');
@@ -858,8 +966,16 @@ ROUTES.dashboard = function () {
   }
   const k = (label, v, type, sub) => `<a class="kpi" onclick="UI.af=Object.assign(UI.af,{type:'${type}',status:'Active',q:'',pasture:'',year:'',breed:''});UI.onlySel=false;location.hash='#/animals'"><div class="kl">${label}</div><div class="kv">${num(v)}</div>${sub ? `<div class="ks">${sub}</div>` : ''}</a>`;
   const ev = recentEvents(12);
-  main(page('Home', `<button class="btn primary" onclick="actCalving()">Record calving</button><button class="btn" onclick="pickThen('Treatment',null,actTreat)">Treat</button><button class="btn" onclick="pickThen('Weights',null,actWeigh)">Weigh</button><button class="btn" onclick="actEditAnimal()">Add animal</button>`,
-    `<div class="kpis">${k('Head on hand', act.length, '')}${k('Cows', cnt('Cow'), 'Cow')}${k('Heifers', cnt('Heifer'), 'Heifer')}${k('Bulls', cnt('Bull'), 'Bull')}${k('Steers', cnt('Steer'), 'Steer')}${k('Calves', calves, 'calves', 'on the cow')}</div>
+  main(page('Home', '',
+    `${workResumeCard()}<div class="quick">
+      <a href="#/work/new" class="qb primary"><b>Work cattle</b><span>shots, weigh, preg, castrate…</span></a>
+      <a href="javascript:void 0" onclick="actCalving()" class="qb"><b>New calf</b><span>record a calving</span></a>
+      <a href="javascript:void 0" onclick="actEditAnimal()" class="qb"><b>Add animal</b><span>bought or new</span></a>
+      <a href="javascript:void 0" onclick="actMoney()" class="qb"><b>Expense</b><span>receipt, vet, feed, tools</span></a>
+      <a href="javascript:void 0" onclick="findAnimalBox()" class="qb"><b>Find a tag</b><span>open an animal</span></a>
+      <a href="javascript:void 0" onclick="pickThen('Move',null,actMove)" class="qb"><b>Move cattle</b><span>to another pasture</span></a>
+     </div>
+    <div class="kpis">${k('Head on hand', act.length, '')}${k('Cows', cnt('Cow'), 'Cow')}${k('Heifers', cnt('Heifer'), 'Heifer')}${k('Bulls', cnt('Bull'), 'Bull')}${k('Steers', cnt('Steer'), 'Steer')}${k('Calves', calves, 'calves', 'on the cow')}</div>
     <div class="cols">${card('Needs attention', remHtml(reminders()))}${card(y + ' calving', calvingSummary(cs) + `<p><a href="#/calving">Calving page →</a></p>`)}</div><div style="height:16px"></div>
     ${card('Recent work', ev.length ? table([{ h: 'Date', f: e => fmtD(e.date) }, { h: 'What', f: e => esc(e.kind) }, { h: 'Animal', f: e => e.n > 1 ? plural(e.n, 'head', 'head') : aLink(e.id) }, { h: '', f: e => e.text }], ev) : '<p class="muted">Nothing recorded yet.</p>')}`));
 };
@@ -870,25 +986,57 @@ function animalFilter() {
   return DB.animals.filter(a => {
     if (UI.onlySel) return SEL.has(a.id);
     if (f.status && (a.status || 'Active') !== f.status) return false;
-    if (f.type === 'calves') { if (!/calf/.test(typeOf(a))) return false; } else if (f.type && typeOf(a) !== f.type) return false;
+    const ty = typeOf(a);
+    if (f.type === 'calves') { if (!/calf/.test(ty)) return false; }
+    else if (f.type === 'females') { if (a.sex !== 'F' || /calf/.test(ty)) return false; }
+    else if (f.type === 'cull') { if (!a.cull) return false; }
+    else if (f.type === 'open') { if (!breedable(a) || repro(a).status !== 'Open') return false; }
+    else if (f.type === 'bred') { if (!breedable(a) || repro(a).status !== 'Bred') return false; }
+    else if (f.type && ty !== f.type) return false;
     if (f.pasture === '-') { if (a.pastureId) return false; } else if (f.pasture && a.pastureId !== f.pasture) return false;
     if (f.year && (a.birthDate || '').slice(0, 4) !== f.year) return false;
     if (f.breed && (a.breed || '') !== f.breed) return false;
     if (q && ![a.tag, a.name, a.eid, a.regNo, a.color, a.breed, a.notes, damText(a), sireText(a)].some(x => (x || '').toLowerCase().includes(q))) return false;
     return true;
-  }).sort((a, b) => natCmp(a.tag || a.name, b.tag || b.name) || (b.birthDate || '').localeCompare(a.birthDate || ''));
+  }).sort(ANSORT[UI.asort] ? ANSORT[UI.asort].f : ANSORT.tag.f);
 }
+const lwOf = a => { const w = lastW(a); return w && w.weight ? +w.weight : null; };
+const ANSORT = {
+  tag: { l: 'Tag', f: (a, b) => natCmp(a.tag || a.name, b.tag || b.name) || (b.birthDate || '').localeCompare(a.birthDate || '') },
+  tagd: { l: 'Tag, high to low', f: (a, b) => natCmp(b.tag || b.name, a.tag || a.name) },
+  young: { l: 'Youngest first', f: (a, b) => (b.birthDate || '').localeCompare(a.birthDate || '') },
+  old: { l: 'Oldest first', f: (a, b) => (a.birthDate || '9').localeCompare(b.birthDate || '9') },
+  kind: { l: 'Kind', f: (a, b) => TYPES.indexOf(typeOf(a)) - TYPES.indexOf(typeOf(b)) || natCmp(a.tag, b.tag) },
+  pasture: { l: 'Pasture', f: (a, b) => natCmp(pastureName(a.pastureId) || '~', pastureName(b.pastureId) || '~') || natCmp(a.tag, b.tag) },
+  heavy: { l: 'Heaviest first', f: (a, b) => (lwOf(b) ?? -1) - (lwOf(a) ?? -1) },
+  light: { l: 'Lightest first', f: (a, b) => (lwOf(a) ?? 1e9) - (lwOf(b) ?? 1e9) },
+  due: { l: 'Due to calve', f: (a, b) => ((breedable(a) && repro(a).due) || '9').localeCompare((breedable(b) && repro(b).due) || '9') }
+};
 ROUTES.animals = function () {
   const f = UI.af;
   const years = [...new Set(DB.animals.map(a => (a.birthDate || '').slice(0, 4)).filter(Boolean))].sort().reverse();
   const breeds = [...new Set(DB.animals.map(a => a.breed).filter(Boolean))].sort();
   const sel = (k, list, label) => `<select onchange="UI.af.${k}=this.value;UI.onlySel=false;drawAnimals()">${opts([['', label], ...list], f[k], false)}</select>`;
-  main(page('Animals', `<button class="btn" onclick="exportAnimals(animalFilter())">Export CSV</button><button class="btn primary" onclick="actEditAnimal()">Add animal</button>`,
-    `<div class="toolbar"><input class="search" type="search" placeholder="Search tag, name, EID, dam, sire…" value="${esc(f.q)}" oninput="UI.af.q=this.value;UI.onlySel=false;drawAnimals()">
-     ${sel('status', ['Active', 'Sold', 'Dead', 'Reference'], 'Any status')}${sel('type', [...TYPES, ['calves', 'All calves']], 'All kinds')}${sel('pasture', [...pastureOpts(), ['-', '(no pasture)']], 'All pastures')}${sel('year', years, 'Any birth year')}${breeds.length > 1 ? sel('breed', breeds, 'All breeds') : ''}</div>
+  main(page('Animals', `<button class="btn hide-sm" onclick="exportAnimals(animalFilter())">Export CSV</button><button class="btn primary" onclick="actEditAnimal()">+ Add animal</button>`,
+    `<div class="toolbar afilters"><input class="search" type="search" placeholder="Search tag, name, EID, dam, sire…" value="${esc(f.q)}" oninput="UI.af.q=this.value;UI.onlySel=false;drawAnimals()">
+     ${sel('type', [...TYPES, ['calves', 'All calves'], ['females', 'Cows + heifers'], ['bred', 'Bred'], ['open', 'Open'], ['cull', 'Marked to cull']], 'All kinds')}${sel('status', ['Active', 'Sold', 'Dead', 'Reference'], 'Any status')}${sel('pasture', [...pastureOpts(), ['-', '(no pasture)']], 'All pastures')}${sel('year', years, 'Any birth year')}${breeds.length > 1 ? sel('breed', breeds, 'All breeds') : ''}
+     <select onchange="UI.asort=this.value;drawAnimals()" aria-label="Sort">${opts(Object.entries(ANSORT).map(([k, s]) => [k, 'Sort: ' + s.l]), UI.asort || 'tag', false)}</select></div>
      <div id="selbar"></div><div class="card" style="padding:0" id="alist"></div>`));
   drawAnimals();
 };
+// phone: one tappable row per animal instead of a wide table
+function animalRows(list) {
+  if (!list.length) return empty(DB.animals.length ? 'No animals match.' : 'No animals yet. Tap “+ Add animal”.');
+  const shown = list.slice(0, UI.aLimit || 300);
+  return `<div class="alist">${shown.map(a => {
+    const lw = lastW(a), r = breedable(a) ? repro(a) : null;
+    return `<div class="arow${SEL.has(a.id) ? ' sel' : ''}"><label class="atick"><input type="checkbox" ${SEL.has(a.id) ? 'checked' : ''} onclick="toggleSel('${a.id}',this.checked,event)"></label>
+     <a class="amain" href="#/animal/${a.id}">${(a.photos || [])[0] ? `<img data-pid="${a.photos[0]}" alt="">` : `<span class="noimg">${esc((typeOf(a)[0] || '?'))}</span>`}
+      <span class="atxt"><b>${esc(keyOf(a))}</b>${a.name && a.name !== a.tag ? ' <span class="muted">' + esc(a.name) + '</span>' : ''}
+      <small>${[typeOf(a), ageStr(a), a.breed, pastureName(a.pastureId), lw && lw.weight ? num(lw.weight) + ' lb' : ''].filter(Boolean).map(esc).join(' · ')}</small>
+      <span>${isActive(a) ? '' : `<span class="chip ${a.status === 'Dead' ? 'red' : ''}">${esc(a.status)}</span>`}${r ? reproChip(r) : ''}${withdrawalUntil(a) ? '<span class="chip amber">withdrawal</span>' : ''}${a.cull ? '<span class="chip amber">cull</span>' : ''}</span></span></a></div>`;
+  }).join('')}</div>${list.length > shown.length ? `<p style="text-align:center"><button class="btn" onclick="UI.aLimit=(UI.aLimit||300)+300;drawAnimals()">Show more (${list.length - shown.length} left)</button></p>` : ''}`;
+}
 function drawAnimals() {
   const list = animalFilter(), rm = {};
   const showRepro = list.some(breedable);
@@ -900,19 +1048,21 @@ function drawAnimals() {
     { h: 'Last weight', f: a => { const w = lastW(a); return w && w.weight ? num(w.weight) : ''; }, cls: 'num hide-sm' },
     { h: 'Status', f: a => (isActive(a) ? '' : `<span class="chip ${a.status === 'Dead' ? 'red' : ''}">${esc(a.status)}</span>`) + (showRepro && breedable(a) ? reproChip(repro(a)) : '') + (withdrawalUntil(a) ? '<span class="chip amber">withdrawal</span>' : '') }
   ];
-  $('#alist').innerHTML = `<div style="padding:10px 14px" class="muted small">${plural(list.length, 'animal')}${UI.onlySel ? ' (just the ticked ones — <a href="javascript:void 0" onclick="UI.onlySel=false;drawAnimals()">show all</a>)' : ''}</div>` +
-    table(cols, list, { empty: DB.animals.length ? 'No animals match.' : 'No animals yet.', rowAttr: a => SEL.has(a.id) ? 'class="sel"' : '' });
+  $('#alist').innerHTML = `<div style="padding:10px 14px" class="muted small">${plural(list.length, 'animal')}${list.length ? ` · <a href="javascript:void 0" onclick="toggleAll(true)">tick all</a>` : ''}${UI.onlySel ? ' (just the ticked ones — <a href="javascript:void 0" onclick="UI.onlySel=false;drawAnimals()">show all</a>)' : ''}</div>` +
+    (isPhone() ? animalRows(list) : table(cols, list, { empty: DB.animals.length ? 'No animals match.' : 'No animals yet.', rowAttr: a => SEL.has(a.id) ? 'class="sel"' : '' }));
+  hydratePhotos($('#alist'));
   drawSelbar();
 }
 function drawSelbar() {
   const el = $('#selbar'); if (!el) return;
   const n = selIds().length;
   el.innerHTML = n ? `<div class="selbar"><b>${plural(n, 'animal')} ticked</b>
+   <button class="btn sm primary" onclick="startWork(selIds())">Work these</button><button class="btn sm" onclick="groupAct('kind')">Change kind</button>
    <button class="btn sm" onclick="groupAct('move')">Move</button><button class="btn sm" onclick="groupAct('treat')">Treat</button><button class="btn sm" onclick="groupAct('weigh')">Weigh</button>
    <button class="btn sm" onclick="groupAct('breed')">Breed</button><button class="btn sm" onclick="groupAct('preg')">Preg check</button><button class="btn sm" onclick="groupAct('sell')">Sold / died</button>
    <button class="btn sm" onclick="groupAct('csv')">Export</button><span class="sp"></span><button class="btn link sm" onclick="SEL.clear();UI.onlySel=false;drawAnimals()">Clear</button></div>` : '';
 }
-function toggleSel(id, on, e) { if (e) e.stopPropagation(); on ? SEL.add(id) : SEL.delete(id); const tr = e && e.target.closest('tr'); if (tr) tr.classList.toggle('sel', on); drawSelbar(); }
+function toggleSel(id, on, e) { if (e) e.stopPropagation(); on ? SEL.add(id) : SEL.delete(id); const tr = e && e.target.closest('tr,.arow'); if (tr) tr.classList.toggle('sel', on); drawSelbar(); }
 function toggleAll(on) { for (const a of animalFilter()) on ? SEL.add(a.id) : SEL.delete(a.id); drawAnimals(); }
 
 // ---------------- one animal
@@ -922,10 +1072,11 @@ ROUTES.animal = function (id) {
   const tab = UI.tab[id] || 'history', t = typeOf(a), fem = isFemale(a), r = fem ? repro(a) : null;
   const photo = (a.photos || [])[0];
   const wd = withdrawalUntil(a);
-  const chips = [(isActive(a) ? `<span class="chip green">${esc(t)}</span>` : `<span class="chip ${a.status === 'Dead' ? 'red' : ''}">${esc(a.status)}</span> <span class="chip">${esc(t)}</span>`), r && breedable(a) ? reproChip(r) : '', wd ? `<span class="chip amber">withdrawal to ${fmtD(wd)}</span>` : ''].join(' ');
+  const kindChip = `<button class="chip ${isActive(a) ? 'green' : ''} chipbtn" onclick="actKind(['${id}'])" title="Change what it is">${esc(t)} ✎</button>`;
+  const chips = [(isActive(a) ? kindChip : `<span class="chip ${a.status === 'Dead' ? 'red' : ''}">${esc(a.status)}</span> ${kindChip}`), r && breedable(a) ? reproChip(r) : '', wd ? `<span class="chip amber">withdrawal to ${fmtD(wd)}</span>` : '', a.cull ? '<span class="chip amber">cull</span>' : ''].join(' ');
   const det = (l, v) => v != null && v !== '' ? `<div><span>${l}</span><b>${v}</b></div>` : '';
   const lw = lastW(a), adj = adj205(a);
-  const tabs = [['history', 'History'], ['weights', 'Weights'], ['health', 'Health'], ...(fem ? [['repro', 'Breeding & calves']] : []), ...(isMale(a) ? [['progeny', 'Calves sired']] : []), ['pedigree', 'Pedigree'], ['photos', 'Photos']];
+  const tabs = [['history', 'History'], ['weights', 'Weights'], ['health', 'Health'], ...(fem ? [['repro', 'Breeding & calves']] : []), ...(isMale(a) ? [['progeny', 'Calves sired']] : []), ['notes', 'Notes & scores'], ['pedigree', 'Pedigree'], ['photos', 'Photos' + ((a.photos || []).length ? ' (' + a.photos.length + ')' : '')]];
   let body = '';
   if (tab === 'history') { const ev = eventsFor(a); body = ev.length ? table([{ h: 'Date', f: e => fmtD(e.date) }, { h: 'What', f: e => esc(e.kind) }, { h: '', f: e => e.text }, { h: '', f: e => e.edit ? `<button class="btn link sm" onclick="${e.edit}">edit</button>` : '', cls: 'noprint' }], ev) : empty('No records yet.'); }
   if (tab === 'weights') {
@@ -961,12 +1112,16 @@ ROUTES.animal = function (id) {
     body = `<div class="ped">${box('Animal', a.id, '', 'g0')}${box('Sire', a.sireId, a.sireName, 'g1')}${box('Sire’s sire', s && s.sireId, s && s.sireName, '')}${box('Sire’s dam', s && s.damId, s && s.damName, '')}${box('Dam', a.damId, a.damName, 'g1')}${box('Dam’s sire', d && d.sireId, d && d.sireName, '')}${box('Dam’s dam', d && d.damId, d && d.damName, '')}</div>
      <p class="muted small">Parents come from the Edit screen. Animals you never owned (AI sires, a bought cow’s mother) can be added with status “Reference”, or just typed as a name.</p>`;
   }
-  if (tab === 'photos') body = `<p><label class="btn primary">Add photo<input type="file" accept="image/*" capture="environment" style="display:none" onchange="addPhoto('${id}',this.files[0])"></label></p>
-    ${(a.photos || []).length ? `<div class="photos">${a.photos.map(p => `<figure><img data-pid="${p}" alt="" onclick="viewPhoto('${p}')"><button class="btn sm" onclick="removePhoto('${id}','${p}')">✕</button></figure>`).join('')}</div>` : empty('No photos.')}`;
+  if (tab === 'notes') {
+    const ob = (OBS[id] || []).slice().reverse();
+    body = `<p><button class="btn primary" onclick="actNote('${id}')">Add a note</button></p>` + table([{ h: 'Date', f: o => fmtD(o.date) }, { h: 'What', f: o => esc(o.kind) }, { h: '', f: o => esc(obsText(o)) }, { h: '', f: o => `<button class="btn link sm" onclick="actEditObs('${o.id}')">edit</button>` }], ob, { empty: 'No notes or scores yet. Scores (docility, scrotal, udder…) recorded while working cattle show here too.' });
+  }
+  if (tab === 'photos') body = `<p>${photoBtn(`addPhoto('${id}',this.files)`, '📷 Take or add photos', 'btn primary')}</p>
+    ${(a.photos || []).length ? `<div class="photos">${a.photos.map((p, i) => `<figure><img data-pid="${p}" alt="" onclick="viewPhoto('${p}')"><button class="btn sm" onclick="removePhoto('${id}','${p}')" aria-label="Delete photo">✕</button>${i ? `<button class="btn sm star" onclick="mainPhoto('${id}','${p}')">Make main</button>` : '<span class="chip green star">Main photo</span>'}</figure>`).join('')}</div>` : empty('No photos yet. On a phone the button opens the camera or your photos.')}`;
 
-  main(`<div class="phead noprint"><a href="#/animals">← Animals</a><div class="pact">
-    <button class="btn" onclick="actEditAnimal('${id}')">Edit</button>${isActive(a) ? `<button class="btn" onclick="actWeigh(['${id}'])">Weigh</button><button class="btn" onclick="actTreat(['${id}'])">Treat</button><button class="btn" onclick="actMove(['${id}'])">Move</button>${fem ? `<button class="btn" onclick="actCalving('${id}')">Calving</button>` : ''}<button class="btn" onclick="actSell(['${id}'])">Sold / died</button>` : ''}</div></div>
-   <section class="card"><div class="ahead">${photo ? `<img class="photo" data-pid="${photo}" alt="" onclick="viewPhoto('${photo}')">` : `<div class="ph">no photo</div>`}
+  main(`<div class="phead noprint"><a href="#/animals" class="back">← Animals</a><div class="pact">
+    <button class="btn" onclick="actEditAnimal('${id}')">Edit</button>${photoBtn(`addPhoto('${id}',this.files)`, '📷 Photo')}<button class="btn" onclick="actNote('${id}')">Note</button>${isActive(a) ? `<button class="btn" onclick="actWeigh(['${id}'])">Weigh</button><button class="btn" onclick="actTreat(['${id}'])">Treat</button><button class="btn" onclick="actMove(['${id}'])">Move</button>${fem ? `<button class="btn" onclick="actCalving('${id}')">Calving</button>` : ''}<button class="btn" onclick="actSell(['${id}'])">Sold / died</button>` : ''}</div></div>
+   <section class="card"><div class="ahead">${photo ? `<img class="photo" data-pid="${photo}" alt="" onclick="viewPhoto('${photo}')">` : `<label class="ph addph">📷<span>Add photo</span><input type="file" accept="image/*" multiple style="display:none" onchange="addPhoto('${id}',this.files)"></label>`}
     <div style="flex:1;min-width:220px"><h1>${esc(a.tag || a.name || 'no tag')}${a.tag && a.name ? ' <span class="muted" style="font-weight:400">' + esc(a.name) + '</span>' : ''}</h1>
     <div class="meta">${[ageStr(a) ? ageStr(a) + ' old' : '', a.breed, a.color, pastureName(a.pastureId)].filter(Boolean).map(esc).join(' · ')}</div><div style="margin-top:6px">${chips}</div></div></div>
     <div class="dl" style="margin-top:16px">${det('Born', fmtD(a.birthDate))}${det('Dam', parentLink(a.damId, a.damName))}${det('Sire', parentLink(a.sireId, a.sireName))}${det('Birth weight', a.birthWeight ? num(a.birthWeight) + ' lb' : '')}${det('Calving ease', a.calvingEase)}
@@ -989,21 +1144,44 @@ function lineChart(pts) {
    ${pts.map((p, i) => `<circle cx="${X(xs[i]).toFixed(1)}" cy="${Y(p.y).toFixed(1)}" r="4" fill="#fff" stroke="#2f6d4a" stroke-width="2"><title>${fmtD(p.x)}: ${num(p.y)} lb</title></circle>`).join('')}
    <text x="${L}" y="${H - 4}">${fmtD(pts[0].x)}</text><text x="${W - 10}" y="${H - 4}" text-anchor="end">${fmtD(pts[pts.length - 1].x)}</text></svg>`;
 }
-async function addPhoto(id, file) {
-  if (!file) return;
+// shrink a camera picture (phones take 4-12 MB ones) and keep it; returns its photo id
+async function photoFromFile(file) {
+  const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => rej(new Error('Not a picture HerdBook can read')); i.src = URL.createObjectURL(file); });
+  const sc = Math.min(1, 1600 / Math.max(img.width, img.height)), c = document.createElement('canvas');
+  c.width = Math.round(img.width * sc); c.height = Math.round(img.height * sc); c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+  URL.revokeObjectURL(img.src);
+  const blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.85));
+  const pid = uid(); await Sync.addPhoto(pid, blob); return pid;
+}
+// the camera / photo button: no "capture" so phones offer camera OR the photo library
+const photoBtn = (onchange, label = '📷 Add photo', cls = 'btn') => `<label class="${cls}">${label}<input type="file" accept="image/*" multiple style="display:none" onchange="${onchange}"></label>`;
+async function addPhoto(id, files) {
+  files = files && files.length != null ? [...files] : files ? [files] : [];
+  if (!files.length) return;
   try {
-    const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => rej(new Error('Not a picture HerdBook can read')); i.src = URL.createObjectURL(file); });
-    const sc = Math.min(1, 1600 / Math.max(img.width, img.height)), c = document.createElement('canvas');
-    c.width = Math.round(img.width * sc); c.height = Math.round(img.height * sc); c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
-    const blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.85));
-    const pid = uid(); await Sync.addPhoto(pid, blob);
-    const a = AN(id); await put1('animals', Object.assign({}, a, { photos: [...(a.photos || []), pid] })); refresh(); toast('Photo added');
+    const pids = []; for (const f of files) pids.push(await photoFromFile(f));
+    const a = AN(id); await put1('animals', Object.assign({}, a, { photos: [...(a.photos || []), ...pids] })); refresh(); toast(plural(pids.length, 'photo') + ' added');
   } catch (e) { alert('Could not add the photo: ' + e.message); }
 }
+async function mainPhoto(id, pid) { const a = AN(id); await put1('animals', Object.assign({}, a, { photos: [pid, ...(a.photos || []).filter(p => p !== pid)] })); refresh(); toast('Main photo set'); }
 async function removePhoto(id, pid) {
   if (!confirm('Delete this photo?')) return;
   const a = AN(id); await put1('animals', Object.assign({}, a, { photos: (a.photos || []).filter(p => p !== pid) }));
   await Sync.removePhoto(pid); refresh();
+}
+// quick "what is it now" change, from the kind chip on the animal page or the ticked animals
+function actKind(ids) {
+  const one = ids.length === 1 ? AN(ids[0]) : null;
+  const m = modal(`<h2>${one ? 'What is ' + esc(keyOf(one)) + ' now?' : 'Change kind — ' + plural(ids.length, 'animal')}</h2>
+   <div class="seg col" id="kd">${TYPES.map(t => `<button type="button" class="${one && typeOf(one) === t ? 'on' : ''}" data-k="${t}">${t}</button>`).join('')}</div>
+   <p class="muted small">Picking Cow on a heifer with no calf records marks her as a cow. Bull → Steer records a castration.</p>
+   <div class="mfoot"><span class="sp"></span><button class="btn" onclick="closeModal()">Cancel</button></div>`);
+  m.querySelector('#kd').onclick = async e => {
+    const b = e.target.closest('button'); if (!b) return;
+    const k = b.dataset.k;
+    await saveMany(ids.map(id => ({ coll: 'animals', data: setKind(Object.assign({}, AN(id)), k) })));
+    closeModal(); refresh(); toast(ids.length > 1 ? plural(ids.length, 'animal') + ' set to ' + k : 'Now a ' + k.toLowerCase());
+  };
 }
 
 // ---------------- calving
@@ -1070,7 +1248,7 @@ ROUTES.health = function () {
     body = `<p class="muted small">Animals that must not go to slaughter yet. Always check the product label.</p>` + table([{ h: 'Animal', f: x => aLink(x.a.id) }, { h: 'Kind', f: x => typeOf(x.a) }, { h: 'Clear on', f: x => `<span class="chip amber">${fmtD(addDays(x.d, 1))}</span>` }, { h: 'Products', f: x => x.t.map(t => esc(t.product) + ' (' + fmtD(t.date) + ')').join(', ') }], list, { empty: 'Nothing is in withdrawal.' });
   } else {
     const list = DB.products.slice().sort((a, b) => natCmp(a.name, b.name));
-    body = `<p><button class="btn primary" onclick="actProduct()">Add product</button></p>` + table([{ h: 'Product', f: p => `<a href="javascript:void 0" onclick="actProduct('${p.id}')"><b>${esc(p.name)}</b></a>` }, { h: 'Kind', f: p => esc(p.kind) }, { h: 'Dose', f: p => esc(p.dose) }, { h: 'Route', f: p => esc(p.route) }, { h: 'Withdrawal', f: p => p.withdrawalDays != null ? p.withdrawalDays + ' days' : '' }, { h: 'Booster', f: p => p.boosterDays ? p.boosterDays + ' days' : '' }, { h: 'Times used', f: p => DB.treatments.filter(t => t.product === p.name).length, cls: 'num' }], list, { empty: 'No products yet. They are added here, or remembered the first time you use one.' });
+    body = `<p><button class="btn primary" onclick="actProduct()">Add product</button></p>` + table([{ h: 'Product', f: p => `<a href="javascript:void 0" onclick="actProduct('${p.id}')"><b>${esc(p.name)}</b></a>` }, { h: 'Kind', f: p => esc(p.group || p.kind) }, { h: 'Dose', f: p => esc(doseText(p)) }, { h: 'Route', f: p => esc(p.route) }, { h: 'Withdrawal', f: p => p.withdrawalDays != null ? p.withdrawalDays + ' days' : '' }, { h: 'Booster', f: p => p.boosterDays ? p.boosterDays + ' days' : '' }, { h: 'Times used', f: p => DB.treatments.filter(t => t.product === p.name).length, cls: 'num' }], list, { empty: 'No products yet. They are added here, or remembered the first time you use one.' });
   }
   const wdN = DB.animals.filter(a => isActive(a) && withdrawalUntil(a)).length;
   main(page('Health', `<button class="btn primary" onclick="pickThen('Treatment',null,actTreat)">Record treatment</button>`,
@@ -1106,23 +1284,6 @@ ROUTES.pastures = function (pid) {
   main(page('Pastures', `<button class="btn primary" onclick="actPasture()">Add pasture</button>`,
     (DB.pastures.length ? `<div class="pcards">${cardsHtml}</div>` : card('', empty('No pastures yet. Add the pastures, pens and traps you keep cattle in.'))) +
     `<p class="muted small" style="margin-top:14px">${unas ? `${plural(unas, 'active animal')} not in any pasture. ` : ''}<label><input type="checkbox" ${UI.showRetired ? 'checked' : ''} onchange="UI.showRetired=this.checked;refresh()"> show pastures no longer used</label></p>`));
-};
-
-// ---------------- money
-ROUTES.money = function (yy) {
-  const y = yy || UI.my || thisYear(); UI.my = y;
-  const years = [...new Set([thisYear(), ...DB.money.map(m => (m.date || '').slice(0, 4))])].filter(Boolean).sort().reverse();
-  const list = DB.money.filter(m => (m.date || '').startsWith(y)).sort((a, b) => b.date.localeCompare(a.date));
-  const inc = list.filter(m => m.kind === 'Income'), exp = list.filter(m => m.kind !== 'Income');
-  const sum = l => l.reduce((s, m) => s + (+m.amount || 0), 0);
-  const byCat = l => { const o = {}; l.forEach(m => o[m.category || 'Other'] = (o[m.category || 'Other'] || 0) + (+m.amount || 0)); return Object.entries(o).sort((a, b) => b[1] - a[1]); };
-  const cows = DB.animals.filter(a => typeOf(a) === 'Cow' && (isActive(a) || (a.saleDate || a.deathDate || '') >= y)).length;
-  const catT = (l, tot) => table([{ h: 'Category', f: r => esc(r[0]) }, { h: 'Amount', f: r => usd(r[1]), cls: 'num' }, { h: 'Share', f: r => pct(r[1], tot), cls: 'num' }], l, { empty: 'None.' });
-  main(page('Money', `<select class="btn" onchange="location.hash='#/money/'+this.value">${opts(years, y, false)}</select><button class="btn" onclick="actMoney(null,{kind:'Income'})">Add income</button><button class="btn primary" onclick="actMoney()">Add expense</button>`,
-    `<div class="kpis"><div class="kpi"><div class="kl">Income ${y}</div><div class="kv">${usd(sum(inc))}</div></div><div class="kpi"><div class="kl">Expenses ${y}</div><div class="kv">${usd(sum(exp))}</div></div><div class="kpi"><div class="kl">Net</div><div class="kv">${usd(sum(inc) - sum(exp))}</div></div><div class="kpi"><div class="kl">Net per cow</div><div class="kv">${cows ? usd((sum(inc) - sum(exp)) / cows) : '—'}</div><div class="ks">${plural(cows, 'cow')}</div></div></div>
-    <div class="cols">${card('Income by category', catT(byCat(inc), sum(inc)))}${card('Expenses by category', catT(byCat(exp), sum(exp)))}</div><div style="height:16px"></div>
-    ${card('Entries', table([{ h: 'Date', f: m => fmtD(m.date) }, { h: 'Kind', f: m => m.kind === 'Income' ? '<span class="chip green">Income</span>' : '<span class="chip">Expense</span>' }, { h: 'Category', f: m => esc(m.category) }, { h: 'Amount', f: m => usd(m.amount), cls: 'num' }, { h: 'Paid to / from', f: m => esc(m.payee), cls: 'hide-sm' }, { h: 'Note', f: m => (m.animalId ? aLink(m.animalId) + ' ' : '') + esc(m.note), cls: 'hide-sm' }, { h: '', f: m => `<button class="btn link sm" onclick="actMoney('${m.id}')">edit</button>` }], list, { empty: 'No entries for ' + y + '.' }) + (list.length ? `<p><button class="btn sm" onclick="exportMoney('${y}')">Export ${y} to CSV (for your accountant)</button></p>` : ''))}`,
-    'Sales put in from “Sold / died” and purchases entered on an animal show up here automatically.'));
 };
 
 // ---------------- tasks
@@ -1398,9 +1559,9 @@ function startServiceWorker() {
     reg.addEventListener('updatefound', () => {
       const w = reg.installing; if (!w) return;
       w.addEventListener('statechange', () => {
-        if (w.state === 'installed' && navigator.serviceWorker.controller) {
+        if (w.state === 'installed' && hadController && navigator.serviceWorker.controller && !$('.updbar')) {
           const b = document.createElement('div'); b.className = 'updbar';
-          b.innerHTML = 'A new version of HerdBook is ready. <button class="btn sm" id="upd_go">Use it now</button> <span class="small">(or it starts next time you open HerdBook)</span>';
+          b.innerHTML = 'A new version of HerdBook is ready. <button class="btn sm" id="upd_go">Use it now</button> <button class="btn link sm" onclick="this.parentNode.remove()" aria-label="Later">Later</button>';
           document.body.appendChild(b); b.querySelector('#upd_go').onclick = () => { if (!$('#modal-root').innerHTML || confirm('Close the form you have open?')) w.postMessage('skip'); };
         }
       });
@@ -1408,13 +1569,14 @@ function startServiceWorker() {
     setInterval(() => reg.update().catch(() => { }), 60 * 60 * 1000);
   }).catch(() => { });
 }
-(async function start() {
+// started at the end of work.js, once every part of HerdBook is loaded
+async function start() {
   startServiceWorker();
   try {
     await load();
     await Sync.init({
       onState: () => { renderSync(); const sc = $('#synccard'); if (sc && route().r === 'settings') sc.innerHTML = '<h2>Sync and sign-in</h2>' + syncCard(); },
-      onRemote: async () => { await load(); if ($('#modal-root').innerHTML) UI.stale = true; else refresh(); }
+      onRemote: async () => { await load(); if ($('#modal-root').innerHTML || UI.busy) UI.stale = true; else refresh(); }
     });
     refresh();
     if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => { });
@@ -1424,4 +1586,4 @@ function startServiceWorker() {
   } catch (e) {
     main(`<div class="card" style="margin:40px auto;max-width:520px"><h2>HerdBook could not open its records</h2><p>This browser would not let HerdBook use its storage on this device. In a private / incognito window that can happen — open HerdBook normally, or from its icon.</p><p class="muted small">${esc(e.message)}</p><button class="btn primary" onclick="location.reload()">Try again</button></div>`);
   }
-})();
+}
