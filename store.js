@@ -15,7 +15,7 @@
              at the same moment and one copy overwrites the other, the next sync puts the missing change back. */
 
 const HB = window.HB_CONFIG || {};
-const APP_VERSION = '2.3.2';
+const APP_VERSION = '2.3.3';
 const CHANNEL = /\/test\//.test(location.pathname) || HB.channel === 'test' ? 'test' : 'live';
 const DRIVE = HB.driveBase || 'https://www.googleapis.com';
 const PFX = CHANNEL === 'test' ? 'test-' : '';
@@ -177,14 +177,18 @@ const Drive = (() => {
   }
   // the open farm's files - only the ones whose name starts with `prefix` (records, backups or one photo), never the whole folder
   const esc = s => String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-  function list(loc = LOC, prefix = '', exact = false) {
-    const nm = prefix ? ` and name ${exact ? '=' : 'contains'} '${esc(prefix)}'` : '';
-    return loc ? query('q=' + encodeURIComponent(`'${loc}' in parents and trashed=false${nm}`) + '&fields=' + FIELDS)
-      : query('spaces=appDataFolder' + (nm ? '&q=' + encodeURIComponent(nm.slice(5)) : '') + '&fields=' + FIELDS);
+  // Google's "name contains" search is word-based and unreliable with dashes, so lists never depend on it:
+  // they leave out pictures by their file type (a reliable filter) and the name check is done here.
+  async function list(loc = LOC, prefix = '', exact = false) {
+    const cond = exact ? ` and name = '${esc(prefix)}'` : ` and mimeType != 'image/jpeg'`;
+    const l = await (loc ? query('q=' + encodeURIComponent(`'${loc}' in parents and trashed=false${cond}`) + '&fields=' + FIELDS)
+      : query('spaces=appDataFolder&q=' + encodeURIComponent(cond.slice(5)) + '&fields=' + FIELDS));
+    return prefix && !exact ? l.filter(x => x.name.startsWith(prefix)) : l;
   }
   const find = (name, loc = LOC) => list(loc, name, true);
+  const listAll = (loc = LOC) => loc ? query('q=' + encodeURIComponent(`'${loc}' in parents and trashed=false`) + '&fields=' + FIELDS) : query('spaces=appDataFolder&fields=' + FIELDS);
   const parents = loc => [loc || 'appDataFolder'];
-  async function create(name, body, type, loc = LOC) { const m = await J('/drive/v3/files?fields=id,name', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, parents: parents(loc) }) }); const u = await upload(m.id, body, type); return Object.assign({ name, createdTime: u.modifiedTime }, m, u); }
+  async function create(name, body, type, loc = LOC) { const m = await J('/drive/v3/files?fields=id,name', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, parents: parents(loc), mimeType: type }) }); const u = await upload(m.id, body, type); return Object.assign({ name, createdTime: u.modifiedTime }, m, u); }
   // returns {id, modifiedTime} so this device knows the file it just wrote doesn't need reading back
   const upload = async (id, body, type) => (await f('/upload/drive/v3/files/' + id + '?uploadType=media&fields=id,modifiedTime', { method: 'PATCH', headers: { 'Content-Type': type }, body })).json();
   const text = async id => (await f('/drive/v3/files/' + id + '?alt=media')).text();
@@ -210,15 +214,16 @@ const Drive = (() => {
   async function farmFolders() {
     const a = await tagged(), ids = new Set(a.map(x => x.id));
     // also look by name among folders shared with this person (Google may not show another person's folder tags)
-    let b = []; try { b = await query('q=' + encodeURIComponent(`sharedWithMe and mimeType='${FOLDER}' and name contains 'HerdBook' and trashed=false`) + '&fields=' + encodeURIComponent('nextPageToken,files(' + FOLDER_FIELDS + ')')); } catch { }
+    let b = []; try { b = (await sharedFolders()).filter(x => /^HerdBook/i.test(x.name)); } catch { }
     return [...a, ...b.filter(x => !ids.has(x.id))];
   }
+  const sharedFolders = () => query('q=' + encodeURIComponent(`sharedWithMe and mimeType='${FOLDER}' and trashed=false`) + '&fields=' + encodeURIComponent('nextPageToken,files(' + FOLDER_FIELDS + ')'));
   const tagged = () => query('q=' + encodeURIComponent(`mimeType='${FOLDER}' and appProperties has { key='hb' and value='${FARM_TAG}' } and trashed=false`) + '&fields=' + encodeURIComponent('nextPageToken,files(' + FOLDER_FIELDS + ')'));
   const perms = id => J('/drive/v3/files/' + id + '/permissions?fields=permissions(id,type,role,emailAddress,displayName)').then(j => j.permissions || []);
   const share = (id, email, role, msg) => J('/drive/v3/files/' + id + '/permissions?sendNotificationEmail=true&emailMessage=' + encodeURIComponent(msg), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'user', role, emailAddress: email }) });
   const setRole = (id, pid, role) => J('/drive/v3/files/' + id + '/permissions/' + pid, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role }) });
   const unshare = (id, pid) => f('/drive/v3/files/' + id + '/permissions/' + pid, { method: 'DELETE' });
-  return { list, find, create, upload, text, json, blob, copy, del, who, makeFolder, folder, rename, farmFolders, perms, share, setRole, unshare };
+  return { list, listAll, sharedFolders, find, create, upload, text, json, blob, copy, del, who, makeFolder, folder, rename, farmFolders, perms, share, setRole, unshare };
 })();
 
 // Google's own "pick a file" window: how a farm shared with you is let into HerdBook
@@ -495,7 +500,7 @@ const Sync = (() => {
     await run(true); if (st.state === 'error') throw new Error(st.msg);
     const fo = await Drive.makeFolder('HerdBook – ' + farmName);
     // pictures: copy every one across (from this device, or from the old Drive folder)
-    for (const x of (await Drive.list(null, PFX + 'photo-')).filter(x => x.name.startsWith(PFX + 'photo-'))) {
+    for (const x of (await Drive.listAll(null)).filter(x => x.name.startsWith(PFX + 'photo-'))) {
       const pid = x.name.slice((PFX + 'photo-').length, -4), p = await Store.getPhoto(pid);
       await Drive.create(x.name, p && p.blob ? p.blob : await Drive.blob(x.id), 'image/jpeg', fo.id);
     }
@@ -535,7 +540,8 @@ const Sync = (() => {
     const isFarm = async x => (x.appProperties && x.appProperties.hb === FARM_TAG) || (/^HerdBook/.test(x.name) && (x.appProperties || {}).hb !== (FARM_TAG === 'farm' ? 'farm-test' : 'farm') && (await Drive.list(x.id, PFX + 'herdbook-').catch(() => [])).some(f => f.name.startsWith(PFX + 'herdbook-')));
     const l = [];
     for (const x of await Drive.farmFolders()) if (!x.ownedByMe && !Farms.get().some(f => f.folder === x.id) && await isFarm(x)) l.push(x);
-    const id = l.length === 1 ? l[0].id : l.length > 1 ? await chooseFolder(l) : null;
+    if (!l.length) return { none: true, report: await joinReport() };
+    const id = l.length === 1 ? l[0].id : await chooseFolder(l);
     if (!id) return null;
     const fo = await Drive.folder(id);
     const dbName = Farms.dbFor(id), owner = fo.owners && fo.owners[0];
@@ -547,6 +553,19 @@ const Sync = (() => {
     return fo;
   }
   let chooseFolder = async l => l[0].id;
+  // what this Google account can see, in plain words - for when a shared farm doesn't turn up
+  async function joinReport() {
+    const out = ['Signed in as ' + st.account.email + (Auth.hasFull() ? '' : ' (Google did NOT give the "see shared folders" permission)')];
+    try {
+      const sh = await Drive.sharedFolders();
+      out.push(sh.length ? 'Folders shared with you: ' + sh.slice(0, 12).map(x => '“' + x.name + '”' + (x.owners && x.owners[0] ? ' from ' + (x.owners[0].emailAddress || x.owners[0].displayName) : '')).join(', ') + (sh.length > 12 ? ' …' : '') : 'No folders at all are shared with this Gmail.');
+      for (const x of sh.filter(x => /herdbook/i.test(x.name)).slice(0, 3)) {
+        const fl = await Drive.listAll(x.id).catch(e => { out.push('Can’t look inside “' + x.name + '”: ' + e.message); return null; });
+        if (fl) out.push('Inside “' + x.name + '”: ' + (fl.length ? fl.slice(0, 8).map(f => f.name).join(', ') + (fl.length > 8 ? ' …' : '') : 'nothing yet — the owner’s HerdBook hasn’t synced into it'));
+      }
+    } catch (e) { out.push('Couldn’t ask Google: ' + e.message); }
+    return out.join('\n\n');
+  }
   async function leaveFarm(dbName) {
     if (dbName === Farms.BASE) throw new Error('This is your own farm on this device.');
     if (Store.name() === dbName) await switchFarm(Farms.BASE);

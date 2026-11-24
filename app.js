@@ -1454,7 +1454,7 @@ async function pickFarm(db) {
 }
 async function joinFarmUI() {
   if (!Sync.st.account) { closeModal(); location.hash = '#/settings'; return alert('Sign in with Google first — with the Gmail address the farm owner invited.'); }
-  try { const fo = await Sync.joinFarm(); closeModal(); if (!fo) return alert('No new farm shared with ' + (Sync.st.account.email || 'you') + ' was found.\n\n1. Check the farm owner’s Settings → People on this farm lists exactly this Gmail. If not, they need to type it and tap Send invite.\n2. Farms already on this phone aren’t listed again — tap the farm name at the top to see them.'); location.hash = '#/'; refresh(); toast('Joined ' + farmLabel(Farms.cur())); }
+  try { const fo = await Sync.joinFarm(); closeModal(); if (fo && fo.none) return alert('No farm shared with you was found.\n\nWhat HerdBook can see:\n\n' + fo.report + '\n\nSend this to whoever set up HerdBook.'); if (!fo) return alert('No new farm shared with ' + (Sync.st.account.email || 'you') + ' was found.\n\n1. Check the farm owner’s Settings → People on this farm lists exactly this Gmail. If not, they need to type it and tap Send invite.\n2. Farms already on this phone aren’t listed again — tap the farm name at the top to see them.'); location.hash = '#/'; refresh(); toast('Joined ' + farmLabel(Farms.cur())); }
   catch (e) { alert('Could not join the farm: ' + e.message); }
 }
 async function leaveFarmUI(db) {
