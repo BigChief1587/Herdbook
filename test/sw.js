@@ -3,8 +3,8 @@
    The live copy (/herdbook/) and the test copy (/herdbook/test/) each have their own worker and cache. */
 const SCOPE = self.registration.scope;
 const CH = /\/test\/$/.test(SCOPE) ? 'test' : 'live';
-const CACHE = 'herdbook-' + CH + '-2.3.3-test';
-const FILES = ['./', 'index.html', 'app.css', 'app.js', 'work.js', 'store.js', 'config.js', 'manifest.webmanifest', 'icon.svg', 'icon-192.png', 'icon-512.png', 'icon-maskable-512.png', 'apple-touch-icon.png'];
+const CACHE = 'herdbook-' + CH + '-2.4.0-test';
+const FILES = ['./', 'index.html', 'app.css', 'app.js', 'work.js', 'more.js', 'store.js', 'config.js', 'manifest.webmanifest', 'icon.svg', 'icon-192.png', 'icon-512.png', 'icon-maskable-512.png', 'apple-touch-icon.png'];
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES.map(f => new Request(f, { cache: 'reload' })))));
 });
@@ -19,3 +19,5 @@ self.addEventListener('fetch', e => {
   if (req.mode === 'navigate') { e.respondWith(caches.match(new URL('index.html', SCOPE).href).then(r => r || fetch(req))); return; }
   e.respondWith(caches.match(req, { ignoreSearch: true }).then(r => r || fetch(req)));
 });
+// tapping a HerdBook reminder opens HerdBook on the Tasks page
+self.addEventListener('notificationclick', e => { e.notification.close(); e.waitUntil(self.clients.matchAll({ type: 'window' }).then(l => l.length ? l[0].focus() : self.clients.openWindow(SCOPE + '#/tasks'))); });

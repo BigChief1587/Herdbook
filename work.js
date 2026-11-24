@@ -612,5 +612,4 @@ function exportMoney(y) {
   download('HerdBook money ' + y + '.csv', toCSV([['Date', 'Kind', 'Group', 'Category', 'Schedule F line', 'Amount', 'Paid to / from', 'How paid', 'Check #', 'Pasture', 'Animal', 'Note', 'Receipt #'],
     ...DB.money.filter(m => (m.date || '').startsWith(y)).sort(byDate).map(m => { const ci = catInfo(m.category, m.kind); return [m.date, m.kind, ci.g, m.category, TAXL[ci.line] || '', m.kind === 'Income' ? m.amount : -m.amount, m.payee, m.pay, m.checkNo, pastureName(m.pastureId), m.animalId && AN(m.animalId) ? keyOf(AN(m.animalId)) : '', m.note, m.rid ? m.rid.slice(-6) : '']; })]));
 }
-
-start();
+// HerdBook is started at the end of more.js

@@ -846,16 +846,7 @@ function actPasture(id) {
     del: id ? async () => { if (DB.animals.some(a => a.pastureId === id && isActive(a))) throw new Error('Move the cattle out first'); await del1('pastures', id); } : null
   });
 }
-function actTask(id, preset) {
-  const t = id ? IX.tasks[id] : Object.assign({ date: today() }, preset || {});
-  openForm({
-    title: id ? 'Edit task' : 'Add a task', values: Object.assign({}, t, { animal: t.animalId ? keyOf(AN(t.animalId)) : '' }),
-    fields: [{ k: 'title', label: 'What', req: true, full: true }, { k: 'date', label: 'Due', type: 'date', req: true }, { k: 'animal', label: 'Animal (optional)', type: 'animal', strict: true },
-      { k: 'note', label: 'Notes', type: 'textarea', full: true, rows: 2 }, { k: 'done', label: 'Done', type: 'check', text: 'Done' }],
-    save: v => { const r = Object.assign({}, t, v, { animalId: v.animal }); delete r.animal; delete r.animalText; return put1('tasks', r); },
-    del: id ? () => del1('tasks', id) : null
-  });
-}
+// tasks: actTask / toggleTask / the Tasks page live in more.js
 // notes and scores (docility, scrotal, udder, BSE…) on one animal
 const obsText = o => [o.value != null && o.value !== '' ? o.value + (o.unit ? ' ' + o.unit : '') : '', o.note].filter(Boolean).join(' · ');
 function actNote(id) {
@@ -878,7 +869,6 @@ function actEditObs(id) {
     save: v => put1('obs', Object.assign({}, o, v)), del: () => del1('obs', id)
   });
 }
-async function toggleTask(id) { const t = IX.tasks[id]; await put1('tasks', Object.assign({}, t, { done: !t.done })); refresh(); }
 
 // "show these animals" links: the id list is parked here and the button carries its number
 const LISTS = [];
@@ -927,12 +917,13 @@ function reminders() {
   if (wean.length) out.push({ date: t, cls: '', text: `<b>${plural(wean.length, 'calf', 'calves')}</b> are 200+ days old and not weaned`, ids: wean.map(a => a.id) });
   const wd = DB.animals.filter(a => isActive(a) && withdrawalUntil(a));
   if (wd.length) out.push({ date: t, cls: 'amber', text: `<b>${plural(wd.length, 'animal')}</b> in slaughter withdrawal — don’t sell for meat`, href: '#/health' });
-  for (const k of DB.tasks) if (!k.done && k.date <= addDays(t, 7)) out.push({ date: k.date, cls: k.date < t ? 'red' : '', text: `<a href="javascript:void 0" onclick="actTask('${k.id}')">${esc(k.title)}</a>${k.animalId ? ' — ' + aLink(k.animalId) : ''}`, task: k.id });
-  return out.sort(byDate);
+  for (const k of DB.tasks) if (!k.done && k.date && k.date <= addDays(t, 7)) out.push({ date: k.date, time: taskTime(k), cls: dueAt(k) < Date.now() ? 'red' : '', text: `<a href="javascript:void 0" onclick="actTask('${k.id}')">${esc(k.title)}</a>${taskAnimals(k).slice(0, 3).map(i => ' — ' + aLink(i)).join('')}`, task: k.id });
+  return out.sort((a, b) => (a.date + (a.time || '00:00')).localeCompare(b.date + (b.time || '00:00')));
 }
 function remHtml(list) {
   if (!list.length) return '<p class="muted">Nothing due right now.</p>';
-  return `<ul class="rem">${list.map(r => `<li><span class="when">${r.date < today() ? '<span class="chip red">past due</span>' : fmtD(r.date)}</span><span>${r.href ? `<a href="${r.href}">${r.text}</a>` : r.text}
+  const when = r => r.task ? (dueAt(IX.tasks[r.task]) < Date.now() ? `<span class="chip red">${r.date < today() ? 'past due' : fmtTime(r.time)}</span>` : (r.date === today() ? 'Today' : fmtD(r.date).replace(/, \d{4}$/, '')) + '<br>' + fmtTime(r.time)) : (r.date < today() ? '<span class="chip red">past due</span>' : fmtD(r.date));
+  return `<ul class="rem">${list.map(r => `<li><span class="when">${when(r)}</span><span>${r.href ? `<a href="${r.href}">${r.text}</a>` : r.text}
    ${r.ids ? ` <button class="btn link sm" onclick="showList(${listRef(r.ids)})">show</button>` : ''}
    ${r.task ? ` <button class="btn link sm" onclick="toggleTask('${r.task}')">mark done</button>` : ''}</span></li>`).join('')}</ul>`;
 }
@@ -987,6 +978,8 @@ ROUTES.dashboard = function () {
       <a href="javascript:void 0" onclick="actEditAnimal()" class="qb"><b>Add animal</b><span>bought or new</span></a>
       <a href="javascript:void 0" onclick="actMoney()" class="qb"><b>Expense</b><span>receipt, vet, feed, tools</span></a>
       <a href="javascript:void 0" onclick="findAnimalBox()" class="qb"><b>Find a tag</b><span>open an animal</span></a>
+      <a href="#/family" class="qb"><b>Family tree</b><span>parents, calves, grandcalves</span></a>
+      <a href="#/tasks" class="qb"><b>Tasks</b><span>${(() => { const n = DB.tasks.filter(t => !t.done && t.date && t.date <= today()).length; return n ? plural(n, 'job') + ' due today' : 'jobs &amp; reminders'; })()}</span></a>
       <a href="javascript:void 0" onclick="pickThen('Move',null,actMove)" class="qb"><b>Move cattle</b><span>to another pasture</span></a>
      </div>
     <div class="kpis">${k('Head on hand', act.length, '')}${k('Cows', cnt('Cow'), 'Cow')}${k('Heifers', cnt('Heifer'), 'Heifer')}${k('Bulls', cnt('Bull'), 'Bull')}${k('Steers', cnt('Steer'), 'Steer')}${k('Calves', calves, 'calves', 'on the cow')}</div>
@@ -1090,7 +1083,7 @@ ROUTES.animal = function (id) {
   const chips = [(isActive(a) ? kindChip : `<span class="chip ${a.status === 'Dead' ? 'red' : ''}">${esc(a.status)}</span> ${kindChip}`), r && breedable(a) ? reproChip(r) : '', wd ? `<span class="chip amber">withdrawal to ${fmtD(wd)}</span>` : '', a.cull ? '<span class="chip amber">cull</span>' : ''].join(' ');
   const det = (l, v) => v != null && v !== '' ? `<div><span>${l}</span><b>${v}</b></div>` : '';
   const lw = lastW(a), adj = adj205(a);
-  const tabs = [['history', 'History'], ['weights', 'Weights'], ['health', 'Health'], ...(fem ? [['repro', 'Breeding & calves']] : []), ...(isMale(a) ? [['progeny', 'Calves sired']] : []), ['notes', 'Notes & scores'], ['pedigree', 'Pedigree'], ['photos', 'Photos' + ((a.photos || []).length ? ' (' + a.photos.length + ')' : '')]];
+  const tabs = [['history', 'History'], ['weights', 'Weights'], ['health', 'Health'], ...(fem ? [['repro', 'Breeding & calves']] : []), ...(isMale(a) ? [['progeny', 'Calves sired']] : []), ['notes', 'Notes & scores'], ['pedigree', 'Family'], ['photos', 'Photos' + ((a.photos || []).length ? ' (' + a.photos.length + ')' : '')]];
   let body = '';
   if (tab === 'history') { const ev = eventsFor(a); body = ev.length ? table([{ h: 'Date', f: e => fmtD(e.date) }, { h: 'What', f: e => esc(e.kind) }, { h: '', f: e => e.text }, { h: '', f: e => e.edit ? `<button class="btn link sm" onclick="${e.edit}">edit</button>` : '', cls: 'noprint' }], ev) : empty('No records yet.'); }
   if (tab === 'weights') {
@@ -1120,12 +1113,7 @@ ROUTES.animal = function (id) {
     body = `<div class="dl" style="margin-bottom:14px">${det('Calves sired', pr.length)}${det('Avg birth weight', avg(pr.map(c => c.birthWeight)) ? num(avg(pr.map(c => c.birthWeight))) + ' lb' : '')}${det('Assisted births', pr.length ? pct(pr.filter(c => +c.calvingEase >= 2).length, pr.filter(c => c.calvingEase).length) : '')}${det('Avg weaning ratio', avg(pr.map(c => rm[c.id])) ? Math.round(avg(pr.map(c => rm[c.id]))) : '')}${det('Females bred / exposed', bred.length)}</div>` +
       table([{ h: 'Calf', f: c => aLink(c.id) }, { h: 'Born', f: c => fmtD(c.birthDate) }, { h: 'Sex', f: c => typeOf(c) }, { h: 'Dam', f: c => parentLink(c.damId, c.damName) }, { h: 'Birth wt', f: c => num(c.birthWeight), cls: 'num' }, { h: 'Ease', f: c => c.calvingEase || '', cls: 'num' }, { h: 'Adj 205', f: c => { const x = adj205(c); return x && x.adj ? num(x.adj) : ''; }, cls: 'num' }, { h: 'Ratio', f: c => rm[c.id] || '', cls: 'num' }], pr, { empty: 'No calves recorded for this bull.' });
   }
-  if (tab === 'pedigree') {
-    const box = (lbl, id2, name, cls) => { const x = id2 && AN(id2); return `<div class="pb ${cls}"><small>${lbl}</small>${x ? aLink(x.id) + (x.regNo ? ' <span class="muted small">' + esc(x.regNo) + '</span>' : '') + (x.breed ? '<div class="muted small">' + esc(x.breed) + '</div>' : '') : esc(name || '—')}</div>`; };
-    const s = AN(a.sireId), d = AN(a.damId);
-    body = `<div class="ped">${box('Animal', a.id, '', 'g0')}${box('Sire', a.sireId, a.sireName, 'g1')}${box('Sire’s sire', s && s.sireId, s && s.sireName, '')}${box('Sire’s dam', s && s.damId, s && s.damName, '')}${box('Dam', a.damId, a.damName, 'g1')}${box('Dam’s sire', d && d.sireId, d && d.sireName, '')}${box('Dam’s dam', d && d.damId, d && d.damName, '')}</div>
-     <p class="muted small">Parents come from the Edit screen. Animals you never owned (AI sires, a bought cow’s mother) can be added with status “Reference”, or just typed as a name.</p>`;
-  }
+  if (tab === 'pedigree') body = `<p><a class="btn sm" href="#/family/${id}">Open the full family tree</a></p><div class="tree up">${famUp(a, 3, '')}</div><h3>Calves</h3>${kidsOf(a).length ? `<div class="tree down">${famDown(a, 2)}</div>` : '<p class="muted">None recorded.</p>'}`;
   if (tab === 'notes') {
     const ob = (OBS[id] || []).slice().reverse();
     body = `<p><button class="btn primary" onclick="actNote('${id}')">Add a note</button></p>` + table([{ h: 'Date', f: o => fmtD(o.date) }, { h: 'What', f: o => esc(o.kind) }, { h: '', f: o => esc(obsText(o)) }, { h: '', f: o => `<button class="btn link sm" onclick="actEditObs('${o.id}')">edit</button>` }], ob, { empty: 'No notes or scores yet. Scores (docility, scrotal, udder…) recorded while working cattle show here too.' });
@@ -1300,16 +1288,9 @@ ROUTES.pastures = function (pid) {
     `<p class="muted small" style="margin-top:14px">${unas ? `${plural(unas, 'active animal')} not in any pasture. ` : ''}<label><input type="checkbox" ${UI.showRetired ? 'checked' : ''} onchange="UI.showRetired=this.checked;refresh()"> show pastures no longer used</label></p>`));
 };
 
-// ---------------- tasks
-ROUTES.tasks = function () {
-  const open = DB.tasks.filter(t => !t.done).sort(byDate), done = DB.tasks.filter(t => t.done).sort((a, b) => b.date.localeCompare(a.date)).slice(0, 50);
-  const cols = [{ h: '', cls: 'chk', f: t => `<input type="checkbox" ${t.done ? 'checked' : ''} onclick="toggleTask('${t.id}')">` }, { h: 'Due', f: t => !t.done && t.date < today() ? `<span class="chip red">${fmtD(t.date)}</span>` : fmtD(t.date) }, { h: 'What', f: t => `<a href="javascript:void 0" onclick="actTask('${t.id}')">${esc(t.title)}</a>${t.note ? '<div class="muted small">' + esc(t.note) + '</div>' : ''}` }, { h: 'Animal', f: t => t.animalId ? aLink(t.animalId) : '' }];
-  main(page('Tasks', `<button class="btn primary" onclick="actTask()">Add task</button>`,
-    `<div class="cols">${card('To do', table(cols, open, { empty: 'Nothing on the list.' }))}${card('Reminders HerdBook works out for you', remHtml(reminders().filter(r => !r.task)))}</div><div style="height:16px"></div>${card('Done lately', table(cols, done, { empty: 'Nothing done yet.' }))}`));
-};
-
 // ---------------- reports
 const REPORTS = [
+  ['family', 'Family tree', 'Any animal: parents, grandparents, calves, grandcalves'],
   ['inventory', 'Herd inventory', 'Head count by kind and pasture'],
   ['calving', 'Calving report', 'Every calf born in a year, with totals'],
   ['weaning', 'Weaning report', 'Adjusted 205-day weights and ratios'],
@@ -1323,6 +1304,7 @@ const REPORTS = [
   ['sheet', 'Chute sheet (print)', 'Blank worksheet for working cattle']
 ];
 ROUTES.reports = function (rid) {
+  if (rid === 'family') { location.replace('#/family'); return; }
   rid = rid || UI.rep || 'inventory'; UI.rep = rid;
   const R = buildReport(rid);
   main(page('Reports', `<button class="btn" onclick="window.print()">Print</button>${R.csv ? `<button class="btn" onclick="download(${esc(JSON.stringify(R.title + '.csv'))},REPCSV())">Export CSV</button>` : ''}`,
