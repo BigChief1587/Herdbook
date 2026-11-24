@@ -15,7 +15,7 @@
              at the same moment and one copy overwrites the other, the next sync puts the missing change back. */
 
 const HB = window.HB_CONFIG || {};
-const APP_VERSION = '2.3.1';
+const APP_VERSION = '2.3.2';
 const CHANNEL = /\/test\//.test(location.pathname) || HB.channel === 'test' ? 'test' : 'live';
 const DRIVE = HB.driveBase || 'https://www.googleapis.com';
 const PFX = CHANNEL === 'test' ? 'test-' : '';
@@ -107,27 +107,49 @@ const Auth = (() => {
     if (client || HB.fakeAuth || !(window.google && google.accounts && google.accounts.oauth2)) return;
     client = google.accounts.oauth2.initTokenClient({
       client_id: HB.clientId, scope: SCOPE,
-      callback: r => { const w = waiting; waiting = null; if (!w) return; if (r.error) w.rej(new Error(r.error_description || r.error)); else { set(r.access_token, r.expires_in); w.res(token); } },
+      callback: r => {
+        const w = waiting; waiting = null; if (!w) return;
+        if (r.error) return w.rej(new Error(r.error_description || r.error));
+        const got = (r.scope || '').split(' ').includes(FULL);
+        set(r.access_token, r.expires_in, got ? 3 : 2);
+        if (w.full && !got) return w.rej(new Error('Google didn’t give HerdBook permission to see the farm shared with you. Tap Join again, and on Google’s screen tick the box “See, edit, create and delete all of your Google Drive files”. HerdBook only ever opens HerdBook farm folders.'));
+        w.res(token);
+      },
       error_callback: e => { const w = waiting; waiting = null; if (w) w.rej(new Error(e && e.type === 'popup_closed' ? 'Sign-in was closed before it finished.' : e && e.type === 'popup_failed_to_open' ? 'The Google sign-in window was blocked. Allow pop-ups for HerdBook and try again.' : 'Google sign-in did not finish.')); }
     });
   }
   // sv = which permissions the token was granted with; 2 = can also make + share a farm folder (HerdBook 2.2)
-  function set(t, secs) { token = t; exp = Date.now() + (secs || 3600) * 1000; Store.setMeta('token', { token, exp, sv: 2 }).catch(() => { }); }
-  async function restore() { if (valid()) { Store.setMeta('token', { token, exp, sv: 2 }).catch(() => { }); return; } try { const t = await Store.getMeta('token'); if (t && t.sv === 2 && t.exp > Date.now() + 120000) { token = t.token; exp = t.exp; } } catch { } }
+  // Someone who JOINS a farm shared with them needs HerdBook to see folders shared with them: Google only lets an app
+  // see another person's folder with the wider Drive permission (or through its Picker, which proved unreliable on phones).
+  // A device asks for it once, when "Join a farm shared with me" is tapped; owners never need it.
+  const FULL = 'https://www.googleapis.com/auth/drive', FK = 'hbFullDrive' + (CHANNEL === 'test' ? '-test' : '');
+  const needFull = () => { try { return localStorage.getItem(FK) === '1'; } catch { return false; } };
+  let sv = 2;      // which permissions the token has: 2 = own + shareable farm folders, 3 = also farms shared with you
+  function set(t, secs, s) { token = t; exp = Date.now() + (secs || 3600) * 1000; sv = s || 2; Store.setMeta('token', { token, exp, sv }).catch(() => { }); }
+  async function restore() {
+    if (valid()) { Store.setMeta('token', { token, exp, sv }).catch(() => { }); return; }
+    try { const t = await Store.getMeta('token'); if (t && (t.sv === 2 || t.sv === 3) && t.exp > Date.now() + 120000) { token = t.token; exp = t.exp; sv = t.sv; } } catch { }
+  }
   // preload Google's sign-in script while there is signal, so a tap can open it straight away
   function warm() { if (HB.clientId && navigator.onLine) loadGIS().then(makeClient).catch(() => { }); }
-  const valid = () => !!token && Date.now() < exp - 60000;
-  // interactive = called from a tap (Google needs a tap to open its window)
-  async function get(interactive, hint) {
+  const valid = () => !!token && Date.now() < exp - 60000 && (!needFull() || sv === 3);
+  // interactive = called from a tap (Google needs a tap to open its window); wantFull = joining a shared farm
+  async function get(interactive, hint, wantFull) {
+    if (wantFull && !needFull()) { try { localStorage.setItem(FK, '1'); } catch { } }
     if (valid()) return token;
-    if (HB.fakeAuth) { set('fake-' + (localStorage.getItem('hbFakeUser') || HB.fakeAuth), 3600); return token; }
+    const full = needFull();
+    if (HB.fakeAuth) { set('fake-' + (localStorage.getItem('hbFakeUser') || HB.fakeAuth), 3600, full ? 3 : 2); return token; }
     if (!interactive || !HB.clientId) return null;
     await loadGIS(); makeClient();
-    return new Promise((res, rej) => { waiting = { res, rej }; client.requestAccessToken(hint ? { login_hint: hint, prompt: '' } : { prompt: 'select_account' }); });
+    return new Promise((res, rej) => {
+      waiting = { res: t => { res(t); }, rej, full };
+      client.requestAccessToken(Object.assign({ scope: full ? SCOPE + ' ' + FULL : SCOPE }, hint ? { login_hint: hint, prompt: full && sv !== 3 ? 'consent' : '' } : { prompt: 'select_account' }));
+    });
   }
+  const hasFull = () => sv === 3;
   function drop() { token = null; exp = 0; Store.setMeta('token', null).catch(() => { }); }
   function revoke() { const t = token; drop(); try { if (t && !HB.fakeAuth && window.google) google.accounts.oauth2.revoke(t, () => { }); } catch { } }
-  return { ready, warm, restore, get, valid, drop, revoke, loadScript, token: () => token };
+  return { ready, warm, restore, get, valid, drop, revoke, loadScript, hasFull, token: () => token };
 })();
 
 // ---------------------------------------------------------------- Google Drive
@@ -185,7 +207,13 @@ const Drive = (() => {
   const folder = id => J('/drive/v3/files/' + id + '?fields=' + FOLDER_FIELDS);
   const rename = (id, name) => J('/drive/v3/files/' + id + '?fields=id,name', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
   // farm folders this Google account can see: its own, and ones shared with it
-  const farmFolders = () => query('q=' + encodeURIComponent(`mimeType='${FOLDER}' and appProperties has { key='hb' and value='${FARM_TAG}' } and trashed=false`) + '&fields=' + encodeURIComponent('nextPageToken,files(' + FOLDER_FIELDS + ')'));
+  async function farmFolders() {
+    const a = await tagged(), ids = new Set(a.map(x => x.id));
+    // also look by name among folders shared with this person (Google may not show another person's folder tags)
+    let b = []; try { b = await query('q=' + encodeURIComponent(`sharedWithMe and mimeType='${FOLDER}' and name contains 'HerdBook' and trashed=false`) + '&fields=' + encodeURIComponent('nextPageToken,files(' + FOLDER_FIELDS + ')')); } catch { }
+    return [...a, ...b.filter(x => !ids.has(x.id))];
+  }
+  const tagged = () => query('q=' + encodeURIComponent(`mimeType='${FOLDER}' and appProperties has { key='hb' and value='${FARM_TAG}' } and trashed=false`) + '&fields=' + encodeURIComponent('nextPageToken,files(' + FOLDER_FIELDS + ')'));
   const perms = id => J('/drive/v3/files/' + id + '/permissions?fields=permissions(id,type,role,emailAddress,displayName)').then(j => j.permissions || []);
   const share = (id, email, role, msg) => J('/drive/v3/files/' + id + '/permissions?sendNotificationEmail=true&emailMessage=' + encodeURIComponent(msg), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'user', role, emailAddress: email }) });
   const setRole = (id, pid, role) => J('/drive/v3/files/' + id + '/permissions/' + pid, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role }) });
@@ -501,12 +529,15 @@ const Sync = (() => {
   }
   // let a farm someone shared with you onto this device
   async function joinFarm() {
-    await need();
-    let id = null; try { const l = (await Drive.farmFolders()).filter(x => !x.ownedByMe && !Farms.get().some(f => f.folder === x.id)); if (l.length === 1) id = l[0].id; else if (l.length > 1) id = await chooseFolder(l); } catch { }
-    if (!id) id = await Picker.pick();
+    if (!st.account) throw new Error('Sign in with Google first (Settings).');
+    await Auth.get(true, st.account.email, true);          // first time on this device: Google asks to let HerdBook see farms shared with you
+    // a HerdBook farm: tagged by HerdBook, or a "HerdBook – …" folder with this copy's herd files in it
+    const isFarm = async x => (x.appProperties && x.appProperties.hb === FARM_TAG) || (/^HerdBook/.test(x.name) && (x.appProperties || {}).hb !== (FARM_TAG === 'farm' ? 'farm-test' : 'farm') && (await Drive.list(x.id, PFX + 'herdbook-').catch(() => [])).some(f => f.name.startsWith(PFX + 'herdbook-')));
+    const l = [];
+    for (const x of await Drive.farmFolders()) if (!x.ownedByMe && !Farms.get().some(f => f.folder === x.id) && await isFarm(x)) l.push(x);
+    const id = l.length === 1 ? l[0].id : l.length > 1 ? await chooseFolder(l) : null;
     if (!id) return null;
     const fo = await Drive.folder(id);
-    if (!fo.appProperties || fo.appProperties.hb !== FARM_TAG) throw new Error('That folder isn’t a HerdBook farm.');
     const dbName = Farms.dbFor(id), owner = fo.owners && fo.owners[0];
     if (Farms.get().some(f => f.db === dbName)) { await switchFarm(dbName); return fo; }
     Farms.upd(dbName, { name: fo.name.replace(/^HerdBook – /, ''), folder: id, role: fo.capabilities && fo.capabilities.canEdit ? 'writer' : 'reader', owner: owner ? owner.displayName || owner.emailAddress : '' });
