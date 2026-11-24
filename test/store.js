@@ -15,7 +15,7 @@
              at the same moment and one copy overwrites the other, the next sync puts the missing change back. */
 
 const HB = window.HB_CONFIG || {};
-const APP_VERSION = '2.2.0-test';
+const APP_VERSION = '2.2.1-test';
 const CHANNEL = /\/test\//.test(location.pathname) || HB.channel === 'test' ? 'test' : 'live';
 const DRIVE = HB.driveBase || 'https://www.googleapis.com';
 const PFX = CHANNEL === 'test' ? 'test-' : '';
