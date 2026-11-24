@@ -1454,7 +1454,7 @@ async function pickFarm(db) {
 }
 async function joinFarmUI() {
   if (!Sync.st.account) { closeModal(); location.hash = '#/settings'; return alert('Sign in with Google first — with the Gmail address the farm owner invited.'); }
-  try { const fo = await Sync.joinFarm(); closeModal(); if (!fo) return toast('Nothing picked'); location.hash = '#/'; refresh(); toast('Joined ' + farmLabel(Farms.cur())); }
+  try { const fo = await Sync.joinFarm(); closeModal(); if (!fo) return alert('No farm was picked.\n\nIf the list was empty:\n1. Check the farm owner’s Settings → People on this farm shows your Gmail (' + (Sync.st.account.email || '') + '). If not, they need to tap Send invite.\n2. Check your email for “… shared a folder with you”.\n3. If it still shows nothing on the phone, do this once on a computer signed in with the same Gmail — after that the phone finds the farm by itself.'); location.hash = '#/'; refresh(); toast('Joined ' + farmLabel(Farms.cur())); }
   catch (e) { alert('Could not join the farm: ' + e.message); }
 }
 async function leaveFarmUI(db) {

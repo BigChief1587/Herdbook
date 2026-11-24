@@ -15,7 +15,7 @@
              at the same moment and one copy overwrites the other, the next sync puts the missing change back. */
 
 const HB = window.HB_CONFIG || {};
-const APP_VERSION = '2.3.0';
+const APP_VERSION = '2.3.1';
 const CHANNEL = /\/test\//.test(location.pathname) || HB.channel === 'test' ? 'test' : 'live';
 const DRIVE = HB.driveBase || 'https://www.googleapis.com';
 const PFX = CHANNEL === 'test' ? 'test-' : '';
@@ -205,9 +205,12 @@ const Picker = (() => {
     await new Promise(res => gapi.load('picker', res));
     const appId = HB.appId || String(HB.clientId || '').split('-')[0];
     return new Promise(res => {
-      const view = new google.picker.DocsView(google.picker.ViewId.FOLDERS).setIncludeFolders(true).setSelectFolderEnabled(true).setMimeTypes(FOLDER).setOwnedByMe(false).setQuery('HerdBook');
-      new google.picker.PickerBuilder().addView(view).setOAuthToken(Auth.token()).setDeveloperKey(HB.apiKey).setAppId(appId)
-        .setTitle('Pick the HerdBook farm that was shared with you')
+      // tab 1: folders shared with you (no search filter - phones showed an empty list with one);
+      // tab 2: every folder you can see, in case Google files it somewhere else
+      const shared = new google.picker.DocsView(google.picker.ViewId.FOLDERS).setIncludeFolders(true).setSelectFolderEnabled(true).setOwnedByMe(false);
+      const all = new google.picker.DocsView(google.picker.ViewId.FOLDERS).setIncludeFolders(true).setSelectFolderEnabled(true);
+      new google.picker.PickerBuilder().addView(shared).addView(all).setOAuthToken(Auth.token()).setDeveloperKey(HB.apiKey).setAppId(appId)
+        .setTitle('Pick the “HerdBook – …” folder that was shared with you')
         .setCallback(d => { if (d.action === google.picker.Action.PICKED) res(d.docs[0].id); else if (d.action === google.picker.Action.CANCEL) res(null); })
         .build().setVisible(true);
     });
