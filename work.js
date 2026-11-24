@@ -103,21 +103,50 @@ function actProduct(id, name) {
 }
 
 // ================================================================ WORKING CATTLE
-const WHO = [['all', 'Everyone'], ['intact', 'Bulls + bull calves (not steers)'], ['cows', 'Cows'], ['heifers', 'Heifers'], ['females', 'Cows + heifers'], ['calves', 'All calves'], ['hcalves', 'Heifer calves'], ['bcalves', 'Bull + steer calves'], ['bulls', 'Bulls'], ['steers', 'Steers'], ['males', 'Bulls + steers + their calves']];
+const WHO = [['all', 'Everyone'], ['bullcalves', 'Bull calves'], ['cows', 'Cows'], ['heifers', 'Heifers'], ['females', 'Cows + heifers'], ['breeding', 'Breeding herd (cows, heifers, bulls)'], ['calves', 'All calves'], ['hcalves', 'Heifer calves'], ['bcalves', 'Bull + steer calves'], ['scalves', 'Steer calves'], ['bulls', 'Bulls'], ['steers', 'Steers + steer calves'], ['intact', 'Bulls + bull calves'], ['males', 'All males']];
 function whoOk(w, a) {
   const t = typeOf(a);
   switch (w) {
     case 'cows': return t === 'Cow'; case 'heifers': return t === 'Heifer'; case 'females': return t === 'Cow' || t === 'Heifer';
+    case 'breeding': return t === 'Cow' || t === 'Heifer' || t === 'Bull';
     case 'calves': return /calf/.test(t); case 'hcalves': return t === 'Heifer calf'; case 'bcalves': return t === 'Bull calf' || t === 'Steer calf';
+    case 'bullcalves': return t === 'Bull calf'; case 'scalves': return t === 'Steer calf'; case 'breedable': return breedable(a);
     case 'bulls': return t === 'Bull'; case 'steers': return /^Steer/.test(t); case 'males': return a.sex !== 'F'; case 'intact': return a.sex === 'M';
     default: return true;
   }
 }
 const whoLabel = w => (WHO.find(x => x[0] === w) || ['', 'Everyone'])[1];
+// who a catalogue product is normally for, by its group
+const GROUP_WHO = { 'Blackleg / clostridial vaccines': 'calves', 'Reproductive & lepto vaccines': 'breeding', 'Scours — cow vaccines & newborn calf': 'females', 'Implants': 'steers', 'Breeding & heat synchronization': 'females' };
+const NEWBORN = /First Defense|Ecolizer|Calf-Guard|Colostrum|Electrolytes|Navel/;
+function defaultWho(name) { const p = productByName(name) || {}; if (p.who) return p.who; if (/RB51/.test(p.name || '')) return 'hcalves'; if (NEWBORN.test(p.name || '')) return 'calves'; return GROUP_WHO[p.group] || 'all'; }
+const isPG = p => /Lutalyse|estroPLAN|Estrumate|prostaglandin/i.test(p.name || '');
+const isMLVResp = p => p.group === 'Respiratory vaccines' && !/Inforce|Nasalgen|One Shot \(|Once PMH/.test(p.name || '');
+// Is this product / job right for this animal today? fits = tick it; warn = say why to think twice; stop = untick it
+function check(kind, x, a) {
+  const t = typeOf(a), d = ageDays(a), rs = breedable(a) ? repro(a).status : null, preg = rs === 'Bred' || rs === 'Overdue', maybe = rs === 'Exposed';
+  const out = { fits: whoOk(x.who, a), warn: '', stop: false };
+  if (kind === 'p') {
+    const p = productByName(x.name) || {};
+    if (isPG(p) && (preg || maybe)) { out.fits = false; out.stop = true; out.warn = preg ? 'she is BRED — this can make her abort' : 'she may be bred — this can make her abort'; }
+    else if (isMLVResp(p) && (preg || maybe) && out.fits) out.warn = 'she may be bred — check the label says safe for pregnant cows';
+    else if (p.group === 'Implants' && (t === 'Bull' || t === 'Bull calf' || t === 'Cow')) { out.fits = false; out.warn = 'implants are not for breeding cattle'; }
+    else if (/RB51/.test(p.name || '') && t === 'Heifer calf' && d != null && (d < 120 || d > 365)) { out.fits = false; out.warn = 'Bangs is given at 4–12 months old'; }
+    else if (/^Scour|ScourGuard|Guardian/.test(p.name || '') && out.fits && !preg && !maybe && rs) out.warn = 'not bred — the scours shot protects her coming calf';
+  } else {
+    const p = PROC_BY[x.k] || {};
+    if (p.fx === 'castrate') { out.fits = t === 'Bull calf'; if (t === 'Bull') out.warn = 'a grown bull — not usually castrated'; if (a.sex !== 'M') { out.fits = false; out.stop = true; out.warn = t === 'Steer calf' || t === 'Steer' ? 'already a steer' : 'not a bull'; } }
+    if (p.k === 'bangs') { if (t !== 'Heifer calf') { out.fits = false; out.stop = true; out.warn = 'Bangs vaccination is for heifer calves'; } else if (d != null && (d < 120 || d > 365)) { out.fits = false; out.warn = 'Bangs is given at 4–12 months old'; } }
+    if (p.fx === 'ai') { if (!breedable(a)) { out.fits = false; out.stop = true; out.warn = 'not a breeding-age female'; } else if (preg) { out.fits = false; out.warn = 'already bred'; } }
+    if (p.fx === 'wean' && !/calf/.test(t)) { out.fits = false; out.stop = true; out.warn = 'not a calf on the cow'; }
+    if (p.k === 'dehorn' && a.horn && /Polled|Dehorned/.test(a.horn)) { out.fits = false; out.warn = (a.horn || '').toLowerCase(); }
+  }
+  return out;
+}
 // things done to an animal (each becomes a line in its health record)
 const PROCS = [
-  { k: 'castBand', l: 'Castrated — band', who: 'intact', fx: 'castrate' }, { k: 'castKnife', l: 'Castrated — knife', who: 'intact', fx: 'castrate' },
-  { k: 'dehorn', l: 'Dehorned / disbudded', who: 'all', fx: 'dehorn' }, { k: 'brand', l: 'Branded', who: 'all', fx: 'brand' },
+  { k: 'castBand', l: 'Castrated — band', who: 'bullcalves', fx: 'castrate' }, { k: 'castKnife', l: 'Castrated — knife', who: 'bullcalves', fx: 'castrate' },
+  { k: 'dehorn', l: 'Dehorned / disbudded', who: 'calves', fx: 'dehorn' }, { k: 'brand', l: 'Branded', who: 'all', fx: 'brand' },
   { k: 'retag', l: 'New ear tag put in', who: 'all', input: 'New tag number' }, { k: 'eid', l: 'EID / RFID tag put in', who: 'all', input: 'EID number (or scan)' },
   { k: 'wean', l: 'Weaned', who: 'calves', fx: 'wean' }, { k: 'bangs', l: 'Bangs tattoo (calfhood vaccinated)', who: 'hcalves' },
   { k: 'ai', l: 'AI bred', who: 'females', fx: 'ai' }, { k: 'hoof', l: 'Feet trimmed', who: 'all' }, { k: 'pinkeye', l: 'Pinkeye — treated / patched', who: 'all' },
@@ -129,11 +158,11 @@ const PROC_BY = {}; PROCS.forEach(p => PROC_BY[p.k] = p);
 const N19 = [1, 2, 3, 4, 5, 6, 7, 8, 9];
 const MEAS = [
   { k: 'weight', l: 'Weight', t: 'num', unit: 'lb' }, { k: 'bcs', l: 'Body condition (1 thin – 9 fat)', t: 'seg', o: N19 },
-  { k: 'preg', l: 'Preg check', t: 'preg', who: 'females' }, { k: 'docility', l: 'Docility (1 calm – 6 wild)', t: 'seg', o: [[1, '1 docile'], [2, '2 restless'], [3, '3 nervous'], [4, '4 flighty'], [5, '5 aggressive'], [6, '6 very aggr.']] },
+  { k: 'preg', l: 'Preg check', t: 'preg', who: 'breedable' }, { k: 'docility', l: 'Docility (1 calm – 6 wild)', t: 'seg', o: [[1, '1 docile'], [2, '2 restless'], [3, '3 nervous'], [4, '4 flighty'], [5, '5 aggressive'], [6, '6 very aggr.']] },
   { k: 'scrotal', l: 'Scrotal circumference', t: 'num', unit: 'cm', who: 'intact' }, { k: 'bse', l: 'Breeding soundness (BSE)', t: 'seg', o: ['Pass', 'Fail', 'Defer'], who: 'intact' },
-  { k: 'udder', l: 'Udder score (1 pendulous – 9 tight)', t: 'seg', o: N19, who: 'females' }, { k: 'teat', l: 'Teat score (1 balloon – 9 small)', t: 'seg', o: N19, who: 'females' },
+  { k: 'udder', l: 'Udder score (1 pendulous – 9 tight)', t: 'seg', o: N19, who: 'cows' }, { k: 'teat', l: 'Teat score (1 balloon – 9 small)', t: 'seg', o: N19, who: 'cows' },
   { k: 'feet', l: 'Feet & legs (1 bad – 9 ideal)', t: 'seg', o: N19 }, { k: 'teeth', l: 'Mouth / teeth', t: 'seg', o: ['Calf teeth', '2 tooth', '4 tooth', '6 tooth', 'Full mouth', 'Broken mouth', 'Smooth / gummer'] },
-  { k: 'frame', l: 'Hip height', t: 'num', unit: 'in' }, { k: 'pelvic', l: 'Pelvic area', t: 'num', unit: 'sq cm', who: 'females' },
+  { k: 'frame', l: 'Hip height', t: 'num', unit: 'in' }, { k: 'pelvic', l: 'Pelvic area', t: 'num', unit: 'sq cm', who: 'heifers' },
   { k: 'sort', l: 'Sort to pasture (gate cut)', t: 'pasture' }, { k: 'temp', l: 'Temperature', t: 'num', unit: '°F' }
 ];
 const MEAS_BY = {}; MEAS.forEach(m => MEAS_BY[m.k] = m);
@@ -188,14 +217,14 @@ function workSetup() {
   UI.wdP = [...mine.map(p => p.name), ...CAT.filter(c => !have.has(c.name.toLowerCase())).map(c => c.name), ...extra];
   const prow = (name, i) => { const p = productByName(name) || { name }, on = !!d.prods[name], x = d.prods[name] || {};
     return `<div class="prow${on ? ' on' : ''}" data-i="${i}" data-s="${esc((name + ' ' + (p.group || '')).toLowerCase())}">${ck(on, `onchange="wdProd(${i},this.checked,this)"`, esc(name) + (p.checked || !CAT_BY[name.toLowerCase()] ? '' : ' <span class="chip">check label</span>'), esc(prodSum(p)))}
-      <div class="pextra">${whoSel(x.who || 'all', `onchange="wdProdSet(${i},'who',this.value)" aria-label="Who gets it"`)}<input placeholder="Lot #" value="${esc(x.lot || '')}" oninput="wdProdSet(${i},'lot',this.value)"><button type="button" class="btn link sm" onclick="wdEditProduct(${i})">edit dose / label</button></div></div>`; };
+      <div class="pextra">${whoSel(x.who || defaultWho(name), `onchange="wdProdSet(${i},'who',this.value)" aria-label="Who gets it"`)}<input placeholder="Lot #" value="${esc(x.lot || '')}" oninput="wdProdSet(${i},'lot',this.value)"><button type="button" class="btn link sm" onclick="wdEditProduct(${i})">edit dose / label</button></div></div>`; };
   let pi = 0;
   const myRows = mine.map(p => prow(p.name, pi++)).join('');
   const catRows = PGROUPS.map(g => { const l = CAT.filter(c => c.group === g && !have.has(c.name.toLowerCase())); if (!l.length) return ''; const rows = l.map(c => prow(c.name, pi++)).join(''); const n = l.filter(c => d.prods[c.name]).length; return `<details class="pgrp"${n ? ' open' : ''}><summary>${esc(g)} <span class="muted small">(${l.length})</span></summary>${rows}</details>`; }).join('');
   const exRows = extra.map(n => prow(n, pi++)).join('');
   const procRows = PROCS.map(p => { const on = !!d.procs[p.k]; return `<div class="prow${on ? ' on' : ''}">${ck(on, `onchange="wdProc('${p.k}',this.checked,this)"`, esc(p.l), p.input ? 'You type it for each animal' : '')}<div class="pextra">${whoSel((d.procs[p.k] || {}).who || p.who, `onchange="wdProcWho('${p.k}',this.value)"`)}
      ${p.k === 'brand' ? `<input placeholder="Brand (e.g. Lazy N)" value="${esc(d.brand)}" oninput="UI.wd.brand=this.value">` : ''}${p.k === 'ai' ? comboHtml('wd_sire', 'sire', d.sire, 'AI sire (bull name)', () => animalItems(isMale)).replace('data-combo="1"', 'data-combo="1" oninput="UI.wd.sire=this.value" onchange="UI.wd.sire=this.value"') : ''}</div></div>`; }).join('');
-  const measRows = MEAS.map(m => { const on = !!d.meas[m.k]; return `<div class="prow${on ? ' on' : ''}">${ck(on, `onchange="wdMeas('${m.k}',this.checked,this)"`, esc(m.l), m.who ? 'only ' + whoLabel(m.who === 'intact' ? 'bulls' : m.who).toLowerCase() + (m.who === 'intact' ? ' and bull calves' : '') : '')}<div class="pextra">
+  const measRows = MEAS.map(m => { const on = !!d.meas[m.k]; return `<div class="prow${on ? ' on' : ''}">${ck(on, `onchange="wdMeas('${m.k}',this.checked,this)"`, esc(m.l), m.who ? 'only ' + (m.who === 'breedable' ? 'breeding-age cows and heifers' : whoLabel(m.who).toLowerCase()) : '')}<div class="pextra">
      ${m.k === 'weight' ? `<select onchange="UI.wd.weightKind=this.value" aria-label="Kind of weight">${opts([['Other', 'Ordinary weight'], ['Weaning', 'Weaning weight'], ['Yearling', 'Yearling weight'], ['Sale', 'Sale weight']], d.weightKind, false)}</select>` : ''}
      ${m.k === 'preg' ? `<select onchange="UI.wd.pregMethod=this.value" aria-label="How">${opts(['Palpation', 'Ultrasound', 'Blood test'], d.pregMethod, false)}</select>` : ''}
      ${m.k === 'sort' ? `<span class="muted small">You tap a pasture for each animal.</span>` : ''}</div></div>`; }).join('') + `<div class="prow on">${ck(!!d.meas.note, `onchange="wdMeas('note',this.checked,this)"`, 'Notes box', 'a note for anything odd — lame, bad bag, wild, lost tag')}</div><div class="prow on">${ck(!!d.meas.photo, `onchange="wdMeas('photo',this.checked,this)"`, 'Photo button', 'take a picture of each one')}</div>`;
@@ -223,10 +252,10 @@ function workSetup() {
 function wdCount() { const el = $('#wd_n'); if (!el) return; const n = draftIds(UI.wd).length; el.innerHTML = n ? `<b>${plural(n, 'head', 'head')}</b> picked.` : 'None picked — that’s fine: type each tag at the chute as they come up.'; }
 function wdRow(el, on) { const r = el && el.closest('.prow'); if (r) r.classList.toggle('on', on); const l = el && el.closest('.ck'); if (l) l.classList.toggle('on', on); }
 function wdArr(k, v, on, el) { const l = UI.wd[k], i = l.indexOf(v); if (on && i < 0) l.push(v); if (!on && i >= 0) l.splice(i, 1); wdRow(el, on); wdCount(); }
-function wdProd(i, on, el) { const n = UI.wdP[i]; if (on) UI.wd.prods[n] = UI.wd.prods[n] || { who: 'all', lot: '' }; else delete UI.wd.prods[n]; wdRow(el, on); }
+function wdProd(i, on, el) { const n = UI.wdP[i]; if (on) UI.wd.prods[n] = UI.wd.prods[n] || { who: defaultWho(n), lot: '' }; else delete UI.wd.prods[n]; wdRow(el, on); const s = el && el.closest('.prow') && el.closest('.prow').querySelector('select.who'); if (s && on) s.value = UI.wd.prods[n].who; }
 function wdProdSet(i, k, v) {
   const n = UI.wdP[i];
-  if (!UI.wd.prods[n]) { UI.wd.prods[n] = { who: 'all', lot: '' }; const c = document.querySelector(`#wdprods .prow[data-i="${i}"] input[type=checkbox]`); if (c) { c.checked = true; wdRow(c, true); } }
+  if (!UI.wd.prods[n]) { UI.wd.prods[n] = { who: k === 'who' ? v : defaultWho(n), lot: '' }; const c = document.querySelector(`#wdprods .prow[data-i="${i}"] input[type=checkbox]`); if (c) { c.checked = true; wdRow(c, true); } }
   UI.wd.prods[n][k] = v;
 }
 function wdProc(k, on, el) { if (on) UI.wd.procs[k] = UI.wd.procs[k] || { who: PROC_BY[k].who }; else delete UI.wd.procs[k]; wdRow(el, on); }
@@ -286,10 +315,13 @@ function chuteView(s) {
   const lastNote = (OBS[a.id] || []).filter(o => o.kind === 'Note').slice(-1)[0];
   const given = prev ? new Set(prev.treatments.map(x => x.product)) : null;
   const pObs = k => prev && MEAS_BY[k] ? (prev.obs.find(o => o.kind === measKind(MEAS_BY[k])) || {}).value : null;
-  const prods = s.products.map((sp, i) => { const p = productByName(sp.name) || { name: sp.name }, fits = whoOk(sp.who, a), on = prev ? given.has(p.name) : fits;
-    return `<button type="button" class="tg${on ? ' on' : ''}${fits ? '' : ' dim'}" data-p="${i}"><i></i><span><b>${esc(p.name)}</b><small><span class="dose" data-pi="${i}">${esc(doseText(p, lwOf(a)))}</span>${p.route ? ' · ' + esc(p.route) : ''}${p.site ? ' · ' + esc(p.site) : ''}${fits ? '' : ' · not planned for a ' + esc(t.toLowerCase())}</small></span></button>`; }).join('');
-  const procs = s.procs.map(x => { const p = PROC_BY[x.k]; if (!p) return ''; const fits = whoOk(x.who, a) && !(p.fx === 'castrate' && a.sex !== 'M'), on = prev ? given.has(p.l) : fits;
-    return `<button type="button" class="tg${on ? ' on' : ''}${fits ? '' : ' dim'}" data-x="${x.k}"><i></i><span><b>${esc(p.l)}</b>${p.k === 'brand' && s.brand ? `<small>${esc(s.brand)}</small>` : ''}${p.k === 'ai' && s.sire ? `<small>to ${esc(s.sire)}</small>` : ''}</span></button>${p.input ? `<div class="tgx"><input id="ch_in_${p.k}" class="big" placeholder="${esc(p.input)}" autocomplete="off"></div>` : ''}`; }).join('');
+  // each row: ticked when it fits this animal; a warning line when it needs a second thought; hidden-but-there when it plainly doesn't apply
+  const why = (c, plain) => c.warn ? `<em class="${c.stop ? 'bad' : 'warn'}">${esc(c.warn)}</em>` : (c.fits ? '' : `<em>not planned for a ${esc(plain)}</em>`);
+  const prods = s.products.map((sp, i) => { const p = productByName(sp.name) || { name: sp.name }, c = check('p', sp, a), on = prev ? given.has(p.name) : c.fits;
+    return `<button type="button" class="tg${on ? ' on' : ''}${c.fits ? '' : ' dim'}${c.stop ? ' stop' : ''}" data-p="${i}"><i></i><span><b>${esc(p.name)}</b><small><span class="dose" data-pi="${i}">${esc(doseText(p, lwOf(a)))}</span>${p.route ? ' · ' + esc(p.route) : ''}${p.site ? ' · ' + esc(p.site) : ''}</small>${why(c, t.toLowerCase())}</span></button>`; }).join('');
+  const procs = s.procs.map(x => { const p = PROC_BY[x.k]; if (!p) return ''; const c = check('x', x, a), on = prev ? given.has(p.l) : c.fits;
+    if (c.stop && !on) return `<div class="tgna">${esc(p.l)} — ${esc(c.warn)}</div>`;
+    return `<button type="button" class="tg${on ? ' on' : ''}${c.fits ? '' : ' dim'}" data-x="${x.k}"><i></i><span><b>${esc(p.l)}</b>${p.k === 'brand' && s.brand ? `<small>${esc(s.brand)}</small>` : ''}${p.k === 'ai' && s.sire ? `<small>to ${esc(s.sire)}</small>` : ''}${why(c, t.toLowerCase())}</span></button>${p.input ? `<div class="tgx"><input id="ch_in_${p.k}" class="big" placeholder="${esc(p.input)}" autocomplete="off"></div>` : ''}`; }).join('');
   const pw = prev && prev.weights[0];
   const meas = s.meas.map(k => {
     const m = MEAS_BY[k]; if (!m) return '';
@@ -323,7 +355,7 @@ function chuteView(s) {
 }
 function chuteWire() {
   const ch = $('#chute'); if (!ch) return;
-  ch.addEventListener('click', e => { const b = e.target.closest('.tg'); if (b) { b.classList.toggle('on'); UI.busy = true; } });
+  ch.addEventListener('click', e => { const b = e.target.closest('.tg'); if (!b) return; if (!b.classList.contains('on') && b.classList.contains('stop') && !confirm('Careful: ' + ((b.querySelector('em') || {}).textContent || '') + '.\n\nGive it anyway?')) return; b.classList.toggle('on'); UI.busy = true; });
   ch.addEventListener('input', e => { if (e.target.id !== 'ch_find') UI.busy = true; if (e.target.id === 'ch_weight' || e.target.id === 'ch_est') chuteDoses(); });
   const f = $('#ch_find'); f.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); chuteFind(); } });
   if (!isPhone() && !UI.ch.cur) f.focus();
@@ -389,8 +421,10 @@ async function chuteSave() {
   if (errs.length) { $('#ch_e').textContent = errs.join(' · '); return; }
   const wt = numVal('#ch_weight'), bcs = $('#ch_bcs') ? parseFloat($('#ch_bcs').value) : NaN;
   if (wt != null || !isNaN(bcs)) {
-    ops.push({ coll: 'weights', data: { animalId: a.id, date, weight: wt, bcs: isNaN(bcs) ? null : bcs, kind: s.weightKind || 'Other', batch: b } });
-    if (s.weightKind === 'Weaning' && !rec.weanDate) rec.weanDate = date;
+    // a weaning / yearling weight only means that on a calf / yearling; on a cow it is an ordinary weight
+    const calf = /calf/.test(typeOf(a)), wk = s.weightKind === 'Weaning' && !calf ? 'Other' : s.weightKind === 'Yearling' && (ageDays(a) == null || ageDays(a) > 550) ? 'Other' : (s.weightKind || 'Other');
+    ops.push({ coll: 'weights', data: { animalId: a.id, date, weight: wt, bcs: isNaN(bcs) ? null : bcs, kind: wk, batch: b } });
+    if (wk === 'Weaning' && !rec.weanDate) rec.weanDate = date;
   }
   if ($('#ch_preg') && $('#ch_preg').value) { const fd = parseInt($('#ch_fetal').value); ops.push({ coll: 'pregchecks', data: { femaleId: a.id, date, method: s.pregMethod || 'Palpation', by: s.by || null, result: $('#ch_preg').value, fetalDays: $('#ch_preg').value === 'Bred' && !isNaN(fd) ? fd : null, batch: b } }); }
   for (const k of s.meas) {

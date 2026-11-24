@@ -65,10 +65,12 @@ async function load() {
   COLLS.forEach(c => DB[c] = []);
   for (const r of recs) if (!r.x && DB[r.c] && r.d) DB[r.c].push(r.d);
   reindex();
+  if (DB.settings.length) Farms.upd(Store.name(), { name: S().farmName });
 }
 // ops: [{coll, data}] or [{coll, del:id}] - all saved together or not at all
 async function saveMany(ops) {
   if (!ops.length) return;
+  if (Sync.readOnly()) { toast('View only — the owner hasn’t let you change this farm'); throw new Error('You can only look at this farm. Ask the owner to change you to “Record”.'); }
   for (const o of ops) if (o.data && !o.data.id) o.data.id = uid();
   await Store.putDocs(ops.map(o => { const id = o.del || o.data.id, k = o.coll + '/' + id; return o.del ? { k, c: o.coll, id, d: null, x: 1, u: Store.nextU(k), dirty: 1 } : { k, c: o.coll, id, d: o.data, x: 0, u: Store.nextU(k), dirty: 1 }; }));
   Sync.st.pending += ops.length; renderSync(); Sync.soon();
@@ -252,7 +254,7 @@ const ROUTES = {};
 const NAV = [['dashboard', 'Home'], ['animals', 'Animals'], ['work', 'Work cattle'], ['calving', 'Calving'], ['breeding', 'Breeding'], ['health', 'Health'], ['weights', 'Weights'], ['pastures', 'Pastures'], ['money', 'Money'], ['tasks', 'Tasks'], ['reports', 'Reports'], ['settings', 'Settings']];
 function route() { const [r, ...rest] = location.hash.replace(/^#\/?/, '').split('/'); return { r: ROUTES[r] ? r : 'dashboard', args: rest.map(decodeURIComponent) }; }
 function renderNav(cur) {
-  $('#nav').innerHTML = `${CHANNEL === 'test' ? '<div class="testbar">TEST COPY — not your real herd</div>' : ''}<div class="brand"><img src="icon.svg" alt=""><div><b>${esc(S().farmName)}</b><button id="sync" class="sync" onclick="tapSync()"></button></div><button class="menu" onclick="document.body.classList.toggle('navopen')" aria-label="Menu">&#9776;</button></div>
+  $('#nav').innerHTML = `${CHANNEL === 'test' ? '<div class="testbar">TEST COPY — not your real herd</div>' : ''}<div class="brand"><img src="icon.svg" alt=""><div><button class="farmbtn" onclick="farmMenu()" title="Switch farms">${esc(S().farmName)} <span>▾</span></button>${Sync.readOnly() ? '<span class="rochip">view only</span>' : ''}<button id="sync" class="sync" onclick="tapSync()"></button></div><button class="menu" onclick="document.body.classList.toggle('navopen')" aria-label="Menu">&#9776;</button></div>
   <nav>${NAV.map(([k, l]) => `<a href="#/${k}" class="${cur === k || (cur === 'animal' && k === 'animals') ? 'on' : ''}" onclick="document.body.classList.remove('navopen')">${l}</a>`).join('')}</nav>`;
   // phone: tabs along the bottom, in thumb reach
   let bn = $('#bnav'); if (!bn) { bn = document.createElement('div'); bn.id = 'bnav'; document.body.appendChild(bn); }
@@ -510,6 +512,12 @@ function actEditAnimal(id, preset) {
     ],
     validate: v => {
       if (!v.tag && !v.name) return 'Give it an ear tag or a name';
+      // common-sense age checks (a typo in the year is the usual cause)
+      const age = v.birthDate ? daysBetween(v.birthDate, today()) : null;
+      if (age != null && age < 0) return 'The birth date is in the future';
+      if (age != null && v.kindPick === 'Cow' && age < 450 && !confirm(`A cow only ${ageStr({ birthDate: v.birthDate })} old? Check the birth date.\n\nSave anyway?`)) return 'Check the birth date or the kind';
+      if (age != null && /calf/.test(v.kindPick || '') && age > 400 && !confirm(`${ageStr({ birthDate: v.birthDate })} old is past calf age — it will show as a ${v.kindPick.replace(' calf', '').replace('Bull', 'Bull').toLowerCase()}.\n\nSave anyway?`)) return 'Check the birth date or the kind';
+      if (v.dam && v.dam === id) return 'An animal can’t be its own dam';
       if (v.tag && !v._dupOk) { const d = DB.animals.find(x => x.id !== id && isActive(x) && (x.tag || '').toLowerCase() === v.tag.toLowerCase()); if (d && !confirm(`Tag ${v.tag} is already on an active ${typeOf(d).toLowerCase()}. Save another animal with the same tag?`)) return 'Change the tag, or save again'; }
       return null;
     },
@@ -575,6 +583,12 @@ function actSell(ids) {
     ],
     values: { outcome: 'Sold', date: today(), income: true },
     onChange: f => { const dead = f.elements.outcome.value === 'Dead'; ['price', 'total', 'weight', 'buyer', 'income'].forEach(k => f.elements[k].closest('.fld').style.display = dead ? 'none' : ''); f.elements.cause.closest('.fld').style.display = dead ? '' : 'none'; },
+    validate: v => {
+      if (v.outcome !== 'Sold') return null;
+      const wd = ids.filter(id => withdrawalUntil(AN(id)));
+      if (wd.length && !confirm(`${wd.map(id => keyOf(AN(id))).join(', ')} ${wd.length > 1 ? 'are' : 'is'} still in slaughter withdrawal (until ${fmtD(withdrawalUntil(AN(wd[0])))}). Don't sell for meat before then.\n\nRecord the sale anyway?`)) return 'Sale not saved — in withdrawal';
+      return null;
+    },
     save: async v => {
       const ops = [], n = ids.length;
       const each = v.price != null ? v.price : (v.total != null ? v.total / n : null);
@@ -793,7 +807,7 @@ function actCalving(damId) {
     title: 'Record a calving', wide: true,
     values: { dam: dam ? keyOf(dam) : '', date: today(), outcome: 'Alive', ease: '1', sex: '' },
     fields: [
-      { k: 'dam', label: 'Dam (cow / heifer)', type: 'animal', filter: a => isFemale(a), req: true, strict: true },
+      { k: 'dam', label: 'Dam (cow / heifer)', type: 'animal', filter: a => isFemale(a) && !/calf/.test(typeOf(a)), req: true, strict: true },
       { k: 'date', label: 'Birth date', type: 'date', req: true },
       { k: 'tag', label: 'Calf ear tag', hint: 'Can be added later.' }, { k: 'sex', label: 'Calf sex', type: 'select', options: [['F', 'Heifer calf'], ['M', 'Bull calf'], ['S', 'Steer calf']], req: true },
       { k: 'birthWeight', label: 'Birth weight (lb)', type: 'number' }, { k: 'ease', label: 'Calving ease', type: 'select', options: EASE, blank: false },
@@ -805,7 +819,7 @@ function actCalving(damId) {
     ],
     onChange: (f, e) => {
       if (e && e.target.name !== 'dam') return;
-      const d = findAnimal(f.elements.dam.value, isFemale); const h = f.elements.sire.closest('.fld').querySelector('.hint');
+      const d = findAnimal(f.elements.dam.value, a => isFemale(a) && !/calf/.test(typeOf(a))); const h = f.elements.sire.closest('.fld').querySelector('.hint');
       if (!d) { h.textContent = 'Blank = from the dam’s breeding record.'; return; }
       const r = repro(d); h.textContent = sireText(r) ? 'Blank = ' + sireText(r) + ' (from her breeding record)' : 'No sire on her breeding records.';
     },
@@ -891,7 +905,7 @@ function groupAct(kind) {
   if (kind === 'treat') actTreat(ids);
   if (kind === 'weigh') actWeigh(ids);
   if (kind === 'sell') actSell(ids);
-  if (kind === 'breed' || kind === 'preg') { const f = selIds(isFemale); if (!f.length) return alert('None of the ticked animals are females.'); kind === 'breed' ? actBreed(f) : actPreg(f); }
+  if (kind === 'breed' || kind === 'preg') { const f = selIds(breedable); if (!f.length) return alert('None of the ticked animals are breeding-age cows or heifers.'); if (f.length < selIds().length) toast(plural(selIds().length - f.length, 'animal') + ' left out — not breeding-age females'); kind === 'breed' ? actBreed(f) : actPreg(f); }
   if (kind === 'csv') exportAnimals(ids.map(AN));
 }
 
@@ -1227,7 +1241,7 @@ ROUTES.breeding = function () {
       ...DB.pregchecks.map(p => ({ date: p.date, a: p.femaleId, what: 'Preg check', det: `<span class="chip ${p.result === 'Bred' ? 'green' : 'red'}">${esc(p.result)}</span>${p.fetalDays ? ' ' + p.fetalDays + ' days' : ''}`, edit: `actEditPreg('${p.id}')` }))].sort((x, y) => y.date.localeCompare(x.date)).slice(0, 500);
     body = table([{ h: 'Date', f: e => fmtD(e.date) }, { h: 'Female', f: e => aLink(e.a) }, { h: 'What', f: e => esc(e.what) }, { h: '', f: e => e.det }, { h: '', f: e => `<button class="btn link sm" onclick="${e.edit}">edit</button>` }], ev, { empty: 'No breeding records yet.' });
   }
-  main(page('Breeding', `<button class="btn" onclick="actTurnIn()">Bull turn-in</button><button class="btn" onclick="actPullBull()">Pull bull</button><button class="btn" onclick="pickThen('AI / breeding',isFemale,actBreed)">AI / breeding</button><button class="btn primary" onclick="pickThen('Pregnancy check',isFemale,actPreg)">Preg check</button>`,
+  main(page('Breeding', `<button class="btn" onclick="actTurnIn()">Bull turn-in</button><button class="btn" onclick="actPullBull()">Pull bull</button><button class="btn" onclick="pickThen('AI / breeding',breedable,actBreed)">AI / breeding</button><button class="btn primary" onclick="pickThen('Pregnancy check',breedable,actPreg)">Preg check</button>`,
     `<div class="kpis">${['Bred', 'Exposed', 'Open', 'Not exposed'].map(s => `<a class="kpi" onclick="UI.btab='status';UI.bstat='${s}';refresh()"><div class="kl">${s}</div><div class="kv">${cnt(s)}</div></a>`).join('')}</div>
      <div class="tabs"><a href="javascript:void 0" class="${tab === 'status' ? 'on' : ''}" onclick="UI.btab='status';refresh()">This season</a><a href="javascript:void 0" class="${tab === 'log' ? 'on' : ''}" onclick="UI.btab='log';refresh()">All records</a></div>${card('', body)}`,
     `Due dates use a ${S().gestation}-day gestation (change it in Settings). A calving closes the season for that female.`));
@@ -1404,7 +1418,9 @@ ROUTES.settings = function () {
      <div class="fld"><label>Gestation (days)</label><input id="s_g" type="number" value="${s.gestation}"></div><div class="fld"><label>Birth weight to use when missing (lb)</label><input id="s_bw" type="number" value="${s.defaultBW}"></div></div>
      <p><button class="btn primary" onclick="saveSettings()">Save</button></p>`)}
    ${card('Sync and sign-in', syncCard(), 'id="synccard"')}
-   </div><div style="height:16px"></div><div class="cols">
+   </div><div style="height:16px"></div>
+   ${card('People on this farm', peopleCard(), 'id="peoplecard"')}
+   <div class="cols">
    ${card('Backups', `<p>${Sync.st.account ? 'Every day HerdBook syncs, it keeps a copy of your herd in your Google account (the last 30 days), plus a copy before every HerdBook update.' : 'Sign in with Google and HerdBook keeps daily copies of your herd in your Google account.'} You can also save a copy to this device:</p>
      <p><button class="btn primary" onclick="downloadBackup()">Download a backup file</button> ${Sync.st.account ? '<button class="btn" onclick="showDriveBackups()">Restore an earlier day…</button>' : ''}</p>
      <p class="muted small">To restore from a file, pick it here. Everything in HerdBook is replaced by what is in the file, on every phone and computer signed in to this herd.${Sync.st.account ? ' A copy of the herd as it is now is kept in Google first.' : ''} The file does not include photos.</p>
@@ -1417,7 +1433,72 @@ ROUTES.settings = function () {
    ${card('Pick lists', `<p class="muted small">One per line. These fill the drop-downs; you can always type something else.</p><div class="grid3">
      ${[['breeds', 'Breeds'], ['colors', 'Colors / markings'], ['routes', 'Treatment routes'], ['sites', 'Injection sites'], ['incomeCats', 'Income categories'], ['expenseCats', 'Expense categories']].map(([k, l]) => `<div class="fld"><label>${l}</label><textarea id="s_${k}" rows="8">${esc(s[k].join('\n'))}</textarea></div>`).join('')}</div>
      <p><button class="btn primary" onclick="saveSettings()">Save lists</button></p>`)}`));
+  drawPeople();
 };
+// ---------------- farms on this device + the people on a farm
+const farmLabel = f => f.name || (f.db === Farms.BASE ? 'My herd' : 'Farm');
+function farmWhose(f) { return !f.folder || f.role === 'owner' ? (f.folder ? 'Yours · shared with others' : 'Yours') : (f.role === 'reader' ? 'View only' : 'You can record') + (f.owner ? ' · ' + f.owner + '’s farm' : ''); }
+function farmMenu() {
+  const l = Farms.get(), cur = Farms.cur();
+  document.body.classList.remove('navopen');
+  modal(`<h2>Farms</h2><p class="muted small">Tap a farm to work on it. Each farm keeps its own herd, money and records.</p>
+   <div class="farms">${l.map(f => `<div class="farm${f.db === cur.db ? ' on' : ''}"><button type="button" class="fbtn" onclick="pickFarm('${f.db}')"><b>${esc(farmLabel(f))}</b><small>${esc(farmWhose(f))}</small>${f.db === cur.db ? '<span class="chip blue">open</span>' : ''}</button>${f.db !== Farms.BASE ? `<button class="btn link sm" onclick="leaveFarmUI('${f.db}')">remove from this ${isPhone() ? 'phone' : 'device'}</button>` : ''}</div>`).join('')}</div>
+   <p><button class="btn primary" onclick="joinFarmUI()">+ Join a farm shared with me</button></p>
+   <p class="muted small">The farm’s owner invites your Gmail first, from their Settings → People on this farm.</p>
+   <div class="mfoot"><span class="sp"></span><button class="btn" onclick="closeModal()">Close</button></div>`);
+}
+async function pickFarm(db) {
+  closeModal(); if (db === Farms.cur().db) return;
+  if (UI.busy && !confirm('Leave what you were doing without saving?')) return;
+  try { await Sync.switchFarm(db); UI.ch = null; UI.wd = null; SEL.clear(); location.hash = '#/'; refresh(); toast('Now on ' + farmLabel(Farms.cur())); } catch (e) { alert('Could not switch: ' + e.message); }
+}
+async function joinFarmUI() {
+  if (!Sync.st.account) { closeModal(); location.hash = '#/settings'; return alert('Sign in with Google first — with the Gmail address the farm owner invited.'); }
+  try { const fo = await Sync.joinFarm(); closeModal(); if (!fo) return toast('Nothing picked'); location.hash = '#/'; refresh(); toast('Joined ' + farmLabel(Farms.cur())); }
+  catch (e) { alert('Could not join the farm: ' + e.message); }
+}
+async function leaveFarmUI(db) {
+  const f = Farms.get().find(x => x.db === db);
+  if (!confirm(`Take “${farmLabel(f)}” off this ${isPhone() ? 'phone' : 'device'}?\n\nIts records stay safe with the owner. You can join it again any time they still share it.`)) return;
+  try { await Sync.leaveFarm(db); closeModal(); refresh(); toast('Removed from this device'); } catch (e) { alert(e.message); }
+}
+Sync.setChooser(list => new Promise(res => {
+  const m = modal(`<h2>Which farm?</h2><div class="farms">${list.map((f, i) => `<div class="farm"><button type="button" class="fbtn" data-i="${i}"><b>${esc(f.name.replace(/^HerdBook – /, ''))}</b><small>${esc(f.owners && f.owners[0] ? 'from ' + (f.owners[0].displayName || f.owners[0].emailAddress) : '')}</small></button></div>`).join('')}</div><div class="mfoot"><span class="sp"></span><button class="btn" id="ch_cancel">Cancel</button></div>`);
+  m.onclick = e => { const b = e.target.closest('.fbtn'); if (b) res(list[+b.dataset.i].id); else if (e.target.id === 'ch_cancel') res(null); };
+}));
+function peopleCard() {
+  const s = Sync.st, f = Farms.cur();
+  if (!s.account) return '<p>Sign in with Google first. Then you can invite your wife, family or hired help to record on this farm from their own phone, with their own Gmail.</p>';
+  if (f.folder && f.role !== 'owner') return `<p>This is <b>${esc(f.owner || 'someone else')}</b>’s farm. ${f.role === 'reader' ? 'You can look but not change anything.' : 'You can record on it.'} Only the owner can invite or remove people.</p><div id="ppl"></div>`;
+  return `<p>Let your wife, family or hired help record on this farm from their own phone with their own Gmail. You stay in charge — you can change what they can do, or remove them, any time.</p>
+   <div id="ppl">${f.folder ? '<p class="muted">Loading…</p>' : '<p><b>Right now only you use this farm.</b></p>'}</div>
+   <div class="grid2"><div class="fld"><label>Their Gmail address</label><input id="inv_e" type="email" autocomplete="off" autocapitalize="off" placeholder="name@gmail.com"></div><div class="fld"><label>They can</label>${segHtml('inv_r', 'role', [['writer', 'Record'], ['reader', 'Only look']], 'writer')}</div></div>
+   <p><button class="btn primary" onclick="doInvite()">Send invite</button></p>
+   <p class="muted small">${f.folder ? '' : `The first invite moves this herd into a folder called “HerdBook – ${esc(S().farmName)}” in your Google Drive, so it can be shared. Don’t delete or move that folder. `}Google emails them the invite with the steps. While HerdBook is a private app, their Gmail also has to be on the test-users list in Google Cloud (see SETUP GUIDE).</p>`;
+}
+async function drawPeople() {
+  const el = $('#ppl'), f = Farms.cur(); if (!el || !f.folder || !Sync.st.account) return;
+  try {
+    const l = (await Sync.people()).filter(p => p.type === 'user'), owner = f.role === 'owner';
+    const me = (Sync.st.account.email || '').toLowerCase();
+    el.innerHTML = table([{ h: 'Person', f: p => `<b>${esc(p.displayName || p.emailAddress)}</b>${(p.emailAddress || '').toLowerCase() === me ? ' <span class="chip">you</span>' : ''}<div class="muted small">${esc(p.emailAddress || '')}</div>` },
+      { h: 'Can', f: p => p.role === 'owner' ? '<span class="chip green">Owner</span>' : owner ? `<select onchange="changeRole('${p.id}',this.value)">${opts([['writer', 'Record'], ['reader', 'Only look']], p.role === 'reader' ? 'reader' : 'writer', false)}</select>` : (p.role === 'reader' ? 'Only look' : 'Record') },
+      { h: '', f: p => owner && p.role !== 'owner' ? `<button class="btn sm" onclick="removePerson('${p.id}','${esc(p.emailAddress || '').replace(/'/g, '')}')">Remove</button>` : '' }], l, { empty: 'Nobody yet.' });
+  } catch (e) { el.innerHTML = `<p class="err">${esc(e.needSignIn ? 'Tap “Sync now” above to see who is on this farm.' : e.message)}</p>`; }
+}
+async function doInvite() {
+  const e = $('#inv_e').value.trim(), r = $('#inv_r').value || 'writer';
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e)) return alert('Type their whole Gmail address, like name@gmail.com.');
+  if (e.toLowerCase() === (Sync.st.account.email || '').toLowerCase()) return alert('That’s your own address.');
+  const first = !Farms.cur().folder;
+  if (first && !confirm(`To share, HerdBook moves this herd into a folder called “HerdBook – ${S().farmName}” in your Google Drive. Your other phones and computers follow it on their own.\n\nGo ahead and invite ${e}?`)) return;
+  try { await Sync.invite(e, r, S().farmName); toast('Invite sent to ' + e); ROUTES.settings(); } catch (x) { alert('Could not send the invite: ' + x.message); }
+}
+async function changeRole(pid, r) { try { await Sync.setRole(pid, r); toast(r === 'reader' ? 'Now: only look' : 'Now: can record'); } catch (e) { alert(e.message); drawPeople(); } }
+async function removePerson(pid, email) {
+  if (!confirm(`Remove ${email} from this farm?\n\nThey won’t be able to see or change it any more.`)) return;
+  try { await Sync.remove(pid); toast('Removed ' + email); drawPeople(); } catch (e) { alert(e.message); }
+}
 function syncCard() {
   const s = Sync.st, [cls, txt] = syncLabel(), det = (l, v) => `<div><span>${l}</span><b>${v}</b></div>`;
   if (!s.account) return `<p>Right now this herd is <b>only on this device</b>. Sign in with your Google account and HerdBook:</p>
@@ -1479,7 +1560,7 @@ async function restoreDrive(id, label) {
 async function saveSettings() {
   const s = S(), v = Object.assign({}, s, { farmName: $('#s_name').value.trim() || 'My Herd', gestation: parseInt($('#s_g').value) || 283, defaultBW: parseFloat($('#s_bw').value) || 75 });
   for (const k of ['breeds', 'colors', 'routes', 'sites', 'incomeCats', 'expenseCats']) v[k] = $('#s_' + k).value.split('\n').map(x => x.trim()).filter(Boolean);
-  await put1('settings', v); refresh(); toast('Settings saved');
+  await put1('settings', v); Farms.upd(Store.name(), { name: v.farmName }); Sync.renameFolder(v.farmName); refresh(); toast('Settings saved');
 }
 function exportAnimals(list) {
   const rows = list.map(a => { const lw = lastW(a), x = adj205(a); return [a.tag, a.name, a.eid, a.sex === 'F' ? 'Female' : a.sex === 'M' ? 'Bull' : a.sex === 'S' ? 'Steer' : '', typeOf(a), a.birthDate, a.breed, a.color, damText(a), sireText(a), pastureName(a.pastureId), a.status || 'Active', a.birthWeight, a.calvingEase, x ? x.ww : '', x ? x.adj : '', lw ? lw.weight : '', lw ? lw.date : '', a.regNo, a.brand, a.horn, a.purchaseDate, a.purchasePrice, a.saleDate, a.salePrice, a.buyer, a.deathDate, a.deathCause, a.notes]; });
