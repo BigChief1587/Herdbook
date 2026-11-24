@@ -15,7 +15,7 @@
              at the same moment and one copy overwrites the other, the next sync puts the missing change back. */
 
 const HB = window.HB_CONFIG || {};
-const APP_VERSION = '2.2.1-test';
+const APP_VERSION = '2.3.0-test';
 const CHANNEL = /\/test\//.test(location.pathname) || HB.channel === 'test' ? 'test' : 'live';
 const DRIVE = HB.driveBase || 'https://www.googleapis.com';
 const PFX = CHANNEL === 'test' ? 'test-' : '';
@@ -153,12 +153,28 @@ const Drive = (() => {
     do { const j = await J('/drive/v3/files?pageSize=1000&' + params + (pt ? '&pageToken=' + encodeURIComponent(pt) : '')); out.push(...(j.files || [])); pt = j.nextPageToken; } while (pt);
     return out;
   }
-  // the files of the open farm
-  const list = (loc = LOC) => loc ? query('q=' + encodeURIComponent(`'${loc}' in parents and trashed=false`) + '&fields=' + FIELDS) : query('spaces=appDataFolder&fields=' + FIELDS);
+  // the open farm's files - only the ones whose name starts with `prefix` (records, backups or one photo), never the whole folder
+  const esc = s => String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  function list(loc = LOC, prefix = '', exact = false) {
+    const nm = prefix ? ` and name ${exact ? '=' : 'contains'} '${esc(prefix)}'` : '';
+    return loc ? query('q=' + encodeURIComponent(`'${loc}' in parents and trashed=false${nm}`) + '&fields=' + FIELDS)
+      : query('spaces=appDataFolder' + (nm ? '&q=' + encodeURIComponent(nm.slice(5)) : '') + '&fields=' + FIELDS);
+  }
+  const find = (name, loc = LOC) => list(loc, name, true);
   const parents = loc => [loc || 'appDataFolder'];
-  async function create(name, body, type, loc = LOC) { const m = await J('/drive/v3/files?fields=id,name', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, parents: parents(loc) }) }); await upload(m.id, body, type); return m; }
-  const upload = (id, body, type) => f('/upload/drive/v3/files/' + id + '?uploadType=media', { method: 'PATCH', headers: { 'Content-Type': type }, body });
+  async function create(name, body, type, loc = LOC) { const m = await J('/drive/v3/files?fields=id,name', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, parents: parents(loc) }) }); const u = await upload(m.id, body, type); return Object.assign({ name, createdTime: u.modifiedTime }, m, u); }
+  // returns {id, modifiedTime} so this device knows the file it just wrote doesn't need reading back
+  const upload = async (id, body, type) => (await f('/upload/drive/v3/files/' + id + '?uploadType=media&fields=id,modifiedTime', { method: 'PATCH', headers: { 'Content-Type': type }, body })).json();
   const text = async id => (await f('/drive/v3/files/' + id + '?alt=media')).text();
+  // record files are gzip-squeezed (about 10x smaller) when the phone can; older files are plain JSON - read either
+  async function json(id) {
+    const buf = new Uint8Array(await (await f('/drive/v3/files/' + id + '?alt=media')).arrayBuffer());
+    if (buf[0] === 0x1f && buf[1] === 0x8b) {
+      if (!window.DecompressionStream) throw new Error('This phone is too old to read the farm’s records — update its software (iPhone: iOS 16.4 or newer).');
+      return JSON.parse(await new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'))).text());
+    }
+    return JSON.parse(new TextDecoder().decode(buf));
+  }
   const blob = async id => (await f('/drive/v3/files/' + id + '?alt=media')).blob();
   const copy = (id, name, loc = LOC) => J('/drive/v3/files/' + id + '/copy?fields=id,name', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, parents: parents(loc) }) });
   const del = id => f('/drive/v3/files/' + id, { method: 'DELETE' });
@@ -174,7 +190,7 @@ const Drive = (() => {
   const share = (id, email, role, msg) => J('/drive/v3/files/' + id + '/permissions?sendNotificationEmail=true&emailMessage=' + encodeURIComponent(msg), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'user', role, emailAddress: email }) });
   const setRole = (id, pid, role) => J('/drive/v3/files/' + id + '/permissions/' + pid, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role }) });
   const unshare = (id, pid) => f('/drive/v3/files/' + id + '/permissions/' + pid, { method: 'DELETE' });
-  return { list, create, upload, text, blob, copy, del, who, makeFolder, folder, rename, farmFolders, perms, share, setRole, unshare };
+  return { list, find, create, upload, text, json, blob, copy, del, who, makeFolder, folder, rename, farmFolders, perms, share, setRole, unshare };
 })();
 
 // Google's own "pick a file" window: how a farm shared with you is let into HerdBook
@@ -202,12 +218,36 @@ const Picker = (() => {
 // ---------------------------------------------------------------- sync
 const Sync = (() => {
   const st = { state: 'local', last: null, pending: 0, account: null, msg: '', backups: [], farm: null };
-  let files = null, running = false, again = false, timer = null, onRemote = () => { }, onState = () => { }, started = false;
-  const byName = n => files && files.find(x => x.name === n);
+  let running = false, again = false, timer = null, due = 0, onRemote = () => { }, onState = () => { }, started = false;
   const deviceName = () => /iPhone/.test(navigator.userAgent) ? 'iPhone' : /iPad/.test(navigator.userAgent) ? 'iPad' : /Android/.test(navigator.userAgent) ? 'Android phone' : /Windows/.test(navigator.userAgent) ? 'Windows PC' : 'computer';
   function set(o) { Object.assign(st, o); onState(st); }
   async function countPending() { const l = await Store.allDocs(); set({ pending: l.filter(r => r.dirty).length }); }
   const readOnly = () => !!(st.farm && st.farm.role === 'reader');
+
+  // ---- how a farm is kept in Drive (HerdBook 2.3+)
+  // Records are split into one small file per month they were first made in (herdbook-part-2026-11.json ...),
+  // so a day at the chute only sends this month's file, and a check that finds nothing new costs one tiny listing.
+  // HerdBook 2.2 and older kept everything in one file (herdbook-data.json); it is still read whenever it changes,
+  // so a phone that hasn't updated yet doesn't lose anything.
+  const PART = PFX + 'herdbook-part-', MOVED = PFX + 'herdbook-moved.json';
+  function bucketOf(k) {
+    const id = k.slice(k.indexOf('/') + 1), t = parseInt(id.slice(0, 8), 36);
+    if (id.length >= 10 && /^[0-9a-z]+$/.test(id) && t > 1.5e12 && t < 4.1e12) { const d = new Date(t); return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0'); }
+    let h = 0; for (let i = 0; i < k.length; i++) h = (h * 31 + k.charCodeAt(i)) | 0;
+    return 'x' + (Math.abs(h) % 4);                 // records with hand-made ids (settings, very old imports)
+  }
+  const partName = b => PART + b + '.json';
+  const docOut = r => r.x ? { u: r.u, x: 1 } : { u: r.u, d: r.d };
+  // squeeze with gzip when this browser can (Chrome, Edge, Safari 16.4+): a month of records goes from ~400 KB to ~40 KB
+  async function fileBody(docs) {
+    const s = JSON.stringify({ format: 2, app: APP_VERSION, saved: new Date().toISOString(), by: st.account ? (st.account.name || st.account.email) + ' · ' + deviceName() : deviceName(), docs });
+    if (!window.CompressionStream) return new Blob([s], { type: 'application/json' });
+    return new Blob([await new Response(new Blob([s]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer()], { type: 'application/octet-stream' });
+  }
+  const BT = b => b.type || 'application/json';
+  const dayStr = () => { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); };
+  async function pool(items, n, fn) { const q = items.slice(); await Promise.all(Array.from({ length: Math.min(n, q.length) }, async () => { while (q.length) await fn(q.shift()); })); }
+  const allDocsOut = async () => { const o = {}; for (const r of await Store.allDocs()) o[r.k] = docOut(r); return o; };
 
   // read the open farm's settings from this device
   async function loadFarm() {
@@ -215,7 +255,7 @@ const Sync = (() => {
     LOC = (await Store.getMeta('loc')) || null;
     const acct = await Store.getMeta('account');
     set({ account: acct || null, last: await Store.getMeta('lastSync') || null, state: acct ? 'idle' : 'local', farm: Farms.cur(), msg: '' });
-    files = null; await countPending();
+    await countPending();
   }
   async function init(h) {
     onRemote = h.onRemote || onRemote; onState = h.onState || onState;
@@ -224,13 +264,19 @@ const Sync = (() => {
       started = true; Auth.warm();
       addEventListener('online', () => { Auth.warm(); soon(500); });
       addEventListener('offline', () => set({ state: st.account ? 'offline' : st.state }));
-      document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') soon(800); });
-      // shared farms check more often: someone else may be recording too
-      setInterval(() => { if (LOC || Date.now() % 3 === 0) soon(0); }, 60 * 1000);
+      // coming back to HerdBook: look for news. Putting the phone away: send what's waiting, now.
+      document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') soon(800); else if (st.pending) run(false); });
+      // a check is one small listing, so every minute is cheap; a farm only you use checks every 3 minutes
+      let tick = 0; setInterval(() => { tick++; if (LOC || tick % 3 === 0) soon(0); }, 60 * 1000);
     }
     if (st.account) soon(300);
   }
-  function soon(ms = 2500) { if (!st.account) return; clearTimeout(timer); timer = setTimeout(() => run(false), ms); }
+  // sync in `ms`; a later call never pushes an earlier one back (so steady saving at the chute still sends every minute or so)
+  function soon(ms = 2500) {
+    if (!st.account) return; const at = Date.now() + ms;
+    if (timer && due <= at) return;
+    clearTimeout(timer); due = at; timer = setTimeout(() => { timer = null; due = 0; run(false); }, ms);
+  }
 
   // first sign-in on this device (from a tap)
   async function signIn() {
@@ -245,31 +291,32 @@ const Sync = (() => {
     }
     const acct = { pid: u.permissionId, email: u.emailAddress, name: u.displayName };
     await Store.setMeta('account', acct); set({ account: acct, state: 'idle', msg: '' });
-    files = null; await run(true); return true;
+    await run(true); return true;
   }
   // sign out of every farm on this device
   async function signOut() {
-    let pend = 0; for (const fm of Farms.get()) { if (fm.db === Store.name()) pend += (await Store.allDocs()).filter(r => r.dirty).length; }
+    const pend = (await Store.allDocs()).filter(r => r.dirty).length;
     if (!confirm('Sign out and remove ' + (Farms.get().length > 1 ? 'every farm' : 'this herd') + ' from this device?\n\nYour records stay safe in Google; sign in again to get them back.' + (pend ? `\n\nWARNING: ${pend} change(s) on this device have NOT synced yet and would be lost. Cancel and tap Sync first.` : ''))) return false;
     Auth.revoke();
     const cur = Store.name();
     for (const fm of Farms.get()) if (fm.db !== cur) await Store.drop(fm.db);
     await Store.clearAll(); Farms.reset(); await Store.switchTo(Farms.BASE);
     if (cur !== Farms.BASE) await Store.drop(cur);
-    LOC = null; files = null; set({ account: null, state: 'local', last: null, pending: 0, farm: Farms.cur() }); onRemote(true); return true;
+    LOC = null; set({ account: null, state: 'local', last: null, pending: 0, farm: Farms.cur() }); onRemote(true); return true;
   }
 
-  async function backupIfDue(remote, dataFile) {
-    const day = new Date(); const d = day.getFullYear() + '-' + String(day.getMonth() + 1).padStart(2, '0') + '-' + String(day.getDate()).padStart(2, '0');
-    const want = [];
-    if (!byName(PFX + 'backup-' + d + '.json')) want.push(PFX + 'backup-' + d + '.json');
-    // first time a NEW version of HerdBook touches records an older version wrote
-    if (remote.app && remote.app !== APP_VERSION && !byName(PFX + 'backup-before-v' + APP_VERSION + '.json')) want.push(PFX + 'backup-before-v' + APP_VERSION + '.json');
-    for (const n of want) { try { files.push(await Drive.copy(dataFile.id, n)); } catch (e) { if (e.status !== 403) throw e; } }
-    // keep the newest 30 daily copies and 10 before-update / before-restore copies (only what this account may delete)
-    const old = (re, keep) => files.filter(x => re.test(x.name)).sort((a, b) => b.name.localeCompare(a.name)).slice(keep);
-    const stale = [...old(new RegExp('^' + PFX + 'backup-\\d{4}-'), 30), ...old(new RegExp('^' + PFX + 'backup-before-'), 10)];
-    for (const x of stale) { try { await Drive.del(x.id); files = files.filter(y => y !== x); } catch { } }
+  // a whole-herd copy once a day (newest 30 kept) and one the first time a new HerdBook version syncs (newest 10)
+  async function backupIfDue(legacyApp) {
+    const d = dayStr(), lastDay = await Store.getMeta('backupDay'), ranV = await Store.getMeta('ranVersion');
+    if (lastDay === d && ranV === APP_VERSION) return;
+    const bl = await Drive.list(LOC, PFX + 'backup-'), has = n => bl.some(x => x.name === n), want = [];
+    if (!has(PFX + 'backup-' + d + '.json')) want.push(PFX + 'backup-' + d + '.json');
+    const older = ranV ? ranV !== APP_VERSION : !!(legacyApp && legacyApp !== APP_VERSION);
+    if (older && !has(PFX + 'backup-before-v' + APP_VERSION + '.json')) want.push(PFX + 'backup-before-v' + APP_VERSION + '.json');
+    if (want.length) { const body = await fileBody(await allDocsOut()); for (const n of want) { try { bl.push(await Drive.create(n, body, BT(body))); } catch (e) { if (e.status !== 403) throw e; } } }
+    const old = (re, keep) => bl.filter(x => re.test(x.name)).sort((a, b) => b.name.localeCompare(a.name)).slice(keep);
+    for (const x of [...old(new RegExp('^' + PFX + 'backup-\\d{4}-'), 30), ...old(new RegExp('^' + PFX + 'backup-before-'), 10)]) { try { await Drive.del(x.id); } catch { } }
+    await Store.setMeta('backupDay', d); await Store.setMeta('ranVersion', APP_VERSION);
   }
 
   async function run(interactive) {
@@ -284,45 +331,66 @@ const Sync = (() => {
     let changed = false;
     const db0 = Store.name();
     try {
-      for (let pass = 0; pass < 2; pass++) {
+      for (let pass = 0; pass < 3; pass++) {
         if (LOC) {     // the owner may have changed what we can do on their farm
           const fo = await Drive.folder(LOC), role = fo.ownedByMe ? 'owner' : fo.capabilities && fo.capabilities.canEdit ? 'writer' : 'reader';
-          if (Farms.cur().role !== role) { Farms.upd(Store.name(), { role }); set({ farm: Farms.cur() }); changed = true; }
+          if (Farms.cur().role !== role) { Farms.upd(db0, { role }); set({ farm: Farms.cur() }); changed = true; }
         }
-        files = await Drive.list();         // fresh every time: other devices add files (photos, the first data file)
-        // normally one data file; two can appear if two devices start a brand-new herd at the same moment -> fold them together
-        const dfs = files.filter(x => x.name === DATA_FILE).sort((a, b) => (a.createdTime || a.id).localeCompare(b.createdTime || b.id));
-        let df = dfs[0], remote = { docs: {} }, extra = false;
-        if (df) remote = JSON.parse(await Drive.text(df.id)); if (!remote.docs) remote.docs = {};
-        // the owner made this farm shareable on another device: follow it to its folder
-        if (!LOC && remote.movedTo) { LOC = remote.movedTo; await Store.setMeta('loc', LOC); Farms.upd(db0, { folder: LOC, role: 'owner' }); continue; }
-        if (df && !readOnly()) await backupIfDue(remote, df);
-        for (const x of dfs.slice(1)) {
-          const o = JSON.parse(await Drive.text(x.id));
-          for (const [k, v] of Object.entries(o.docs || {})) if (!remote.docs[k] || v.u > remote.docs[k].u) { remote.docs[k] = v; extra = true; }
+        // one small listing of the record files only (not the photos or backups)
+        const files = (await Drive.list(LOC, PFX + 'herdbook-')).filter(x => x.name.startsWith(PFX + 'herdbook-'));
+        const follow = async to => { LOC = to; await Store.setMeta('loc', LOC); Farms.upd(db0, { folder: LOC, role: 'owner' }); };
+        if (!LOC) { const mv = files.find(x => x.name === MOVED); if (mv) { const o = await Drive.json(mv.id); if (o.movedTo) { await follow(o.movedTo); continue; } } }
+        const seen = (await Store.getMeta('seen')) || {}, seen2 = {};
+        const L = {}, take = [], need = new Set();
+        for (const r of await Store.allDocs()) L[r.k] = r;
+        const merge = (docs, dirty) => { for (const [k, v] of Object.entries(docs || {})) { const r = L[k]; if (!r || v.u > r.u) { const i = k.indexOf('/'); const n = { k, c: k.slice(0, i), id: k.slice(i + 1), u: v.u, d: v.x ? null : v.d, x: v.x ? 1 : 0, dirty: dirty ? 1 : 0 }; take.push(n); L[k] = n; } } };
+        // 1. the one-file format of HerdBook 2.2 and older: read it only when it changed; anything new in it moves into the monthly files
+        let legacyApp = null, moved = null;
+        for (const lf of files.filter(x => x.name === DATA_FILE)) {
+          seen2[lf.id] = lf.modifiedTime;
+          if (seen[lf.id] === lf.modifiedTime) continue;
+          const o = await Drive.json(lf.id); legacyApp = o.app || legacyApp;
+          if (!LOC && o.movedTo) moved = o.movedTo;
+          merge(o.docs, true);
         }
-        const local = await Store.allDocs(), L = {};
-        for (const r of local) L[r.k] = r;
-        // take every remote change that is newer than ours
-        const take = [];
-        for (const [k, v] of Object.entries(remote.docs)) {
-          const r = L[k];
-          if (!r || v.u > r.u) { const i = k.indexOf('/'); const n = { k, c: k.slice(0, i), id: k.slice(i + 1), u: v.u, d: v.x ? null : v.d, x: v.x ? 1 : 0, dirty: 0 }; take.push(n); L[k] = n; }
-        }
+        if (moved) { await follow(moved); continue; }
+        // 2. the monthly files: read only the ones someone changed since this device last looked
+        const parts = files.filter(x => x.name.startsWith(PART)), groups = {};
+        for (const x of parts) { (groups[x.name] || (groups[x.name] = [])).push(x); seen2[x.id] = x.modifiedTime; }
+        const remoteOf = {};
+        const toRead = Object.entries(groups).filter(([, l]) => l.length > 1 || seen[l[0].id] !== l[0].modifiedTime);
+        await pool(toRead, 6, async ([n, l]) => {
+          const docs = {};
+          for (const x of l) { const o = await Drive.json(x.id); for (const [k, v] of Object.entries(o.docs || {})) if (!docs[k] || v.u > docs[k].u) docs[k] = v; }
+          remoteOf[n.slice(PART.length, -5)] = docs;
+        });
+        for (const docs of Object.values(remoteOf)) merge(docs, false);
         if (take.length) { await Store.putDocs(take); changed = true; }
-        // send ours if we have anything Drive does not (compared record by record, so nothing is lost if two people saved at once)
-        const sent = [];
-        for (const r of Object.values(L)) { const v = remote.docs[r.k]; if (!v || r.u > v.u) sent.push([r.k, r.u]); }
-        if (!readOnly() && (sent.length || !df || extra || dfs.length > 1)) {
-          const out = { format: 1, app: APP_VERSION, saved: new Date().toISOString(), by: (st.account.name || st.account.email) + ' · ' + deviceName(), docs: {} };
-          for (const r of Object.values(L)) out.docs[r.k] = r.x ? { u: r.u, x: 1 } : { u: r.u, d: r.d };
-          const body = new Blob([JSON.stringify(out)], { type: 'application/json' });
-          if (df) await Drive.upload(df.id, body, 'application/json'); else files.push(df = await Drive.create(DATA_FILE, body, 'application/json'));
-          for (const x of dfs.slice(1)) { try { await Drive.del(x.id); files = files.filter(y => y !== x); } catch { } }
-          if (LOC && sent.length) setTimeout(() => soon(0), 20000 + Math.random() * 20000);   // shared farm: look again shortly in case someone saved at the same moment
+        // 3. what to send: months holding changes made here, months where Drive is missing something we have
+        //    (two people saved at the same moment and one copy landed on the other), two copies of one month to fold together
+        const byB = {};
+        for (const r of Object.values(L)) { const b = bucketOf(r.k); (byB[b] || (byB[b] = [])).push(r); if (r.dirty) need.add(b); }
+        for (const [b, docs] of Object.entries(remoteOf)) {
+          if (groups[partName(b)].length > 1) need.add(b);
+          for (const r of byB[b] || []) { const v = docs[r.k]; if (!v || r.u > v.u) { need.add(b); break; } }
         }
-        // anything Drive already had (or we just sent) is synced
-        if (!readOnly()) await Store.markSynced(Object.values(L).filter(r => r.dirty).map(r => [r.k, r.u]));
+        for (const b of Object.keys(byB)) if (!groups[partName(b)]) need.add(b);     // a month not in Drive yet (or the first sync ever)
+        if (!readOnly()) {
+          await backupIfDue(legacyApp);
+          if (need.size) {
+            await pool([...need], 4, async b => {
+              const docs = {}; for (const r of byB[b] || []) docs[r.k] = docOut(r);
+              const l = (groups[partName(b)] || []).slice().sort((x, y) => (x.createdTime || x.id).localeCompare(y.createdTime || y.id));
+              const body = await fileBody(docs);
+              const res = l.length ? await Drive.upload(l[0].id, body, BT(body)) : await Drive.create(partName(b), body, BT(body));
+              seen2[res.id] = res.modifiedTime;               // our own write: no need to read it back
+              for (const x of l.slice(1)) { try { await Drive.del(x.id); delete seen2[x.id]; } catch { } }
+            });
+            if (LOC) setTimeout(() => soon(0), 20000 + Math.random() * 20000);   // shared farm: look again shortly in case someone saved at the same moment
+            await Store.markSynced(Object.values(L).filter(r => r.dirty && need.has(bucketOf(r.k))).map(r => [r.k, r.u]));
+          }
+        }
+        await Store.setMeta('seen', seen2);
         break;
       }
       if (!readOnly()) await syncPhotos();
@@ -332,8 +400,8 @@ const Sync = (() => {
     } catch (e) {
       if (e.needSignIn) set({ state: 'signin' });
       else if (e.offline || !navigator.onLine) set({ state: 'offline' });
-      else if (e.status === 404 && LOC) { files = null; set({ state: 'error', msg: 'This farm’s Google Drive folder can’t be found. The owner may have stopped sharing it with you, or deleted it.' }); }
-      else { files = null; set({ state: 'error', msg: e.message }); }
+      else if (e.status === 404 && LOC) set({ state: 'error', msg: 'This farm’s Google Drive folder can’t be found. The owner may have stopped sharing it with you, or deleted it.' });
+      else set({ state: 'error', msg: e.message });
       await countPending();
     } finally {
       running = false;
@@ -342,12 +410,25 @@ const Sync = (() => {
     }
   }
 
+  // photos waiting to go up (or be deleted) - a short list, so a sync never has to look through every picture
+  async function photoQueue() {
+    let q = await Store.getMeta('photoQ');
+    if (!Array.isArray(q)) { q = (await Store.allPhotos()).filter(p => p.del || !p.up).map(p => p.pid); await Store.setMeta('photoQ', q); }
+    return q;
+  }
+  async function queuePhoto(pid) { const q = await photoQueue(); if (!q.includes(pid)) { q.push(pid); await Store.setMeta('photoQ', q); } }
   async function syncPhotos() {
-    for (const p of await Store.allPhotos()) {
-      const name = PFX + 'photo-' + p.pid + '.jpg', f = byName(name);
-      if (p.del) { if (f) { try { await Drive.del(f.id); } catch { } files = files.filter(x => x !== f); } await Store.delPhoto(p.pid); }
-      else if (!p.up && p.blob) { if (!f) files.push(await Drive.create(name, p.blob, 'image/jpeg')); p.up = 1; await Store.putPhoto(p); }
+    const q = await photoQueue(); if (!q.length) return;
+    const left = [];
+    for (const pid of q) {
+      const p = await Store.getPhoto(pid), name = PFX + 'photo-' + pid + '.jpg';
+      try {
+        if (!p) continue;
+        if (p.del) { for (const f of await Drive.find(name)) { try { await Drive.del(f.id); } catch { } } await Store.delPhoto(pid); }
+        else if (!p.up && p.blob) { if (!(await Drive.find(name)).length) await Drive.create(name, p.blob, 'image/jpeg'); p.up = 1; await Store.putPhoto(p); }
+      } catch (e) { left.push(pid); if (e.needSignIn || e.offline) { left.push(...q.slice(q.indexOf(pid) + 1)); break; } }
     }
+    await Store.setMeta('photoQ', [...new Set(left)]);
   }
   // photo for display: this device first, then Drive
   const urls = {};
@@ -355,27 +436,24 @@ const Sync = (() => {
     if (urls[pid]) return urls[pid];
     let p = await Store.getPhoto(pid);
     if ((!p || !p.blob) && st.account && Auth.valid() && navigator.onLine) {
-      try { let f = files && byName(PFX + 'photo-' + pid + '.jpg'); if (!f) { files = await Drive.list(); f = byName(PFX + 'photo-' + pid + '.jpg'); } if (f) { p = { pid, blob: await Drive.blob(f.id), up: 1 }; await Store.putPhoto(p); } } catch { }
+      try { const f = (await Drive.find(PFX + 'photo-' + pid + '.jpg'))[0]; if (f) { p = { pid, blob: await Drive.blob(f.id), up: 1 }; await Store.putPhoto(p); } } catch { }
     }
     return p && p.blob ? (urls[pid] = URL.createObjectURL(p.blob)) : null;
   }
-  async function addPhoto(pid, blob) { await Store.putPhoto({ pid, blob, up: 0 }); soon(); }
-  async function removePhoto(pid) { await Store.putPhoto({ pid, del: 1 }); if (urls[pid]) { URL.revokeObjectURL(urls[pid]); delete urls[pid]; } soon(); }
+  async function addPhoto(pid, blob) { await Store.putPhoto({ pid, blob, up: 0 }); await queuePhoto(pid); soon(); }
+  async function removePhoto(pid) { await Store.putPhoto({ pid, del: 1 }); await queuePhoto(pid); if (urls[pid]) { URL.revokeObjectURL(urls[pid]); delete urls[pid]; } soon(); }
   const forgetUrls = () => { for (const k in urls) { URL.revokeObjectURL(urls[k]); delete urls[k]; } };
 
   // ---- Drive backups (list + restore)
   async function listBackups() {
     if (!st.account) return [];
     if (!Auth.valid()) await Auth.get(true, st.account.email);
-    files = await Drive.list();
-    return files.filter(x => x.name.startsWith(PFX + 'backup-')).sort((a, b) => (b.modifiedTime || '').localeCompare(a.modifiedTime || ''));
+    return (await Drive.list(LOC, PFX + 'backup-')).filter(x => x.name.startsWith(PFX + 'backup-')).sort((a, b) => (b.modifiedTime || '').localeCompare(a.modifiedTime || ''));
   }
-  async function readBackup(id) { return JSON.parse(await Drive.text(id)); }
+  async function readBackup(id) { return Drive.json(id); }
   async function backupBeforeRestore() {
-    if (!files) files = await Drive.list();
-    const df = byName(DATA_FILE); if (!df) return;
     const n = PFX + 'backup-before-restore-' + new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-') + '.json';
-    files.push(await Drive.copy(df.id, n));
+    const body = await fileBody(await allDocsOut()); await Drive.create(n, body, BT(body));
   }
 
   // ---- sharing
@@ -384,19 +462,18 @@ const Sync = (() => {
   async function makeShareable(farmName) {
     await need(); if (LOC) return LOC;
     await run(true); if (st.state === 'error') throw new Error(st.msg);
-    const old = await Drive.list(null);
     const fo = await Drive.makeFolder('HerdBook – ' + farmName);
     // pictures: copy every one across (from this device, or from the old Drive folder)
-    for (const x of old.filter(x => x.name.startsWith(PFX + 'photo-'))) {
-      const pid = x.name.slice((PFX + 'photo-').length, -4); let p = await Store.getPhoto(pid);
-      const b = p && p.blob ? p.blob : await Drive.blob(x.id);
-      await Drive.create(x.name, b, 'image/jpeg', fo.id);
+    for (const x of (await Drive.list(null, PFX + 'photo-')).filter(x => x.name.startsWith(PFX + 'photo-'))) {
+      const pid = x.name.slice((PFX + 'photo-').length, -4), p = await Store.getPhoto(pid);
+      await Drive.create(x.name, p && p.blob ? p.blob : await Drive.blob(x.id), 'image/jpeg', fo.id);
     }
-    LOC = fo.id; await Store.setMeta('loc', LOC); Farms.upd(Store.name(), { folder: LOC, role: 'owner', name: farmName });
+    LOC = fo.id; await Store.setMeta('loc', LOC); await Store.setMeta('seen', {}); Farms.upd(Store.name(), { folder: LOC, role: 'owner', name: farmName });
     await run(true);                                   // writes the herd into the new folder
-    // tell the owner's other phones and computers where the herd went
-    const df = old.find(x => x.name === DATA_FILE);
-    if (df) { const o = JSON.parse(await Drive.text(df.id)); o.movedTo = LOC; await Drive.upload(df.id, new Blob([JSON.stringify(o)], { type: 'application/json' }), 'application/json'); }
+    // tell the owner's other phones and computers where the herd went (both ways, for phones still on HerdBook 2.2)
+    const mark = new Blob([JSON.stringify({ movedTo: LOC })], { type: 'application/json' });
+    const mv = await Drive.find(MOVED, null); if (mv.length) await Drive.upload(mv[0].id, mark, 'application/json'); else await Drive.create(MOVED, mark, 'application/json', null);
+    for (const df of await Drive.find(DATA_FILE, null)) { const o = await Drive.json(df.id); o.movedTo = LOC; await Drive.upload(df.id, new Blob([JSON.stringify(o)], { type: 'application/json' }), 'application/json'); }
     set({ farm: Farms.cur() });
     return LOC;
   }
